@@ -456,6 +456,10 @@ export function PlatformDetailPage() {
                   <strong>{stickyTTL}</strong>
                 </span>
                 <span className="platform-fact">
+                  <span>{t("延迟上限")}</span>
+                  <strong>{platform.max_reference_latency_ms > 0 ? `${platform.max_reference_latency_ms} ms` : t("不限")}</strong>
+                </span>
+                <span className="platform-fact">
                   <span>{t("策略")}</span>
                   <strong>{t(allocationPolicyLabel[platform.allocation_policy])}</strong>
                 </span>
@@ -555,6 +559,27 @@ export function PlatformDetailPage() {
                       invalid={Boolean(editForm.formState.errors.sticky_ttl)}
                       {...editForm.register("sticky_ttl")}
                     />
+                  </div>
+
+                  <div className="field-group">
+                    <label className="field-label" htmlFor="detail-edit-max-reference-latency">
+                      {t("参考延迟上限（可选，ms）")}
+                    </label>
+                    <Input
+                      id="detail-edit-max-reference-latency"
+                      type="number"
+                      min="1"
+                      step="any"
+                      placeholder={t("例如 500")}
+                      invalid={Boolean(editForm.formState.errors.max_reference_latency_ms)}
+                      {...editForm.register("max_reference_latency_ms")}
+                    />
+                    {editForm.formState.errors.max_reference_latency_ms?.message ? (
+                      <p className="field-error">{t(editForm.formState.errors.max_reference_latency_ms.message)}</p>
+                    ) : null}
+                    <p className="muted" style={{ marginTop: 4, fontSize: 12 }}>
+                      {t("仅保留参考延迟不超过此值的节点；留空表示不限。")}
+                    </p>
                   </div>
 
                   <div className="field-group">

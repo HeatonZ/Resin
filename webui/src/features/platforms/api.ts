@@ -10,9 +10,10 @@ import type {
 
 const basePath = "/api/v1/platforms";
 
-type ApiPlatform = Omit<Platform, "regex_filters" | "region_filters"> & {
+type ApiPlatform = Omit<Platform, "regex_filters" | "region_filters" | "max_reference_latency_ms"> & {
   regex_filters?: string[] | null;
   region_filters?: string[] | null;
+  max_reference_latency_ms?: number | null;
   routable_node_count?: number | null;
   reverse_proxy_miss_action?: Platform["reverse_proxy_miss_action"] | null;
   reverse_proxy_empty_account_behavior?: Platform["reverse_proxy_empty_account_behavior"] | null;
@@ -35,6 +36,8 @@ function normalizePlatform(raw: ApiPlatform): Platform {
     reverse_proxy_miss_action: parseMissAction(raw.reverse_proxy_miss_action),
     regex_filters: Array.isArray(raw.regex_filters) ? raw.regex_filters : [],
     region_filters: Array.isArray(raw.region_filters) ? raw.region_filters : [],
+    max_reference_latency_ms:
+      typeof raw.max_reference_latency_ms === "number" ? raw.max_reference_latency_ms : 0,
     routable_node_count: typeof raw.routable_node_count === "number" ? raw.routable_node_count : 0,
     reverse_proxy_empty_account_behavior:
       raw.reverse_proxy_empty_account_behavior === "RANDOM" ||

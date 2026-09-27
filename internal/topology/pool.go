@@ -442,7 +442,7 @@ func (p *GlobalNodePool) notifyAllPlatformsDirty(hash node.Hash) {
 		go func(plat *platform.Platform) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			plat.NotifyDirty(hash, getEntry, subLookup, p.geoLookup)
+			plat.NotifyDirty(hash, getEntry, subLookup, p.geoLookup, p.latencyAuthorities)
 		}(plat)
 	}
 	wg.Wait()
@@ -476,7 +476,7 @@ func (p *GlobalNodePool) RebuildAllPlatforms() {
 		go func(plat *platform.Platform) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			plat.FullRebuild(poolRange, subLookup, p.geoLookup)
+			plat.FullRebuild(poolRange, subLookup, p.geoLookup, p.latencyAuthorities)
 		}(plat)
 	}
 	wg.Wait()
@@ -488,7 +488,7 @@ func (p *GlobalNodePool) RebuildPlatform(plat *platform.Platform) {
 	poolRange := func(fn func(node.Hash, *node.NodeEntry) bool) {
 		p.nodes.Range(fn)
 	}
-	plat.FullRebuild(poolRange, subLookup, p.geoLookup)
+	plat.FullRebuild(poolRange, subLookup, p.geoLookup, p.latencyAuthorities)
 }
 
 // --- Health Management ---
@@ -623,7 +623,7 @@ func (p *GlobalNodePool) RecordLatency(hash node.Hash, rawTarget string, latency
 
 	// If the table transitioned from empty to non-empty, the node might
 	// now satisfy the HasLatency filter — notify platforms.
-	if wasEmpty {
+	if wasEmpty || (isAuthority && p.hasReferenceLatencyFilteredPlatform()) {
 		p.notifyAllPlatformsDirty(hash)
 	}
 
@@ -633,6 +633,15 @@ func (p *GlobalNodePool) RecordLatency(hash node.Hash, rawTarget string, latency
 			p.onNodeLatencyChanged(hash, evictedDomain)
 		}
 	}
+}
+
+func (p *GlobalNodePool) hasReferenceLatencyFilteredPlatform() bool {
+	for _, plat := range p.platformSnapshot() {
+		if plat.MaxReferenceLatencyMs > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // UpdateNodeEgressIP records an egress probe attempt and optionally updates

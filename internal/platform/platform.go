@@ -29,8 +29,9 @@ type Platform struct {
 	Name string
 
 	// Filter configuration.
-	RegexFilters  node.TagFilter
-	RegionFilters []string // lowercase ISO codes, supports negation "!xx"
+	RegexFilters          node.TagFilter
+	RegionFilters         []string // lowercase ISO codes, supports negation "!xx"
+	MaxReferenceLatencyMs float64
 
 	// Other config fields.
 	StickyTTLNs                      int64
@@ -76,13 +77,15 @@ func (p *Platform) FullRebuild(
 	poolRange PoolRangeFunc,
 	subLookup node.SubLookupFunc,
 	geoLookup GeoLookupFunc,
+	latencyAuthorities ...func() []string,
 ) {
 	p.viewMu.Lock()
 	defer p.viewMu.Unlock()
 
+	authorities := resolveLatencyAuthorities(latencyAuthorities)
 	p.view.Clear()
 	poolRange(func(h node.Hash, entry *node.NodeEntry) bool {
-		if p.evaluateNode(entry, subLookup, geoLookup) {
+		if p.evaluateNode(entry, subLookup, geoLookup, authorities) {
 			p.view.Add(h)
 		}
 		return true
@@ -96,6 +99,7 @@ func (p *Platform) NotifyDirty(
 	getEntry GetEntryFunc,
 	subLookup node.SubLookupFunc,
 	geoLookup GeoLookupFunc,
+	latencyAuthorities ...func() []string,
 ) {
 	p.viewMu.Lock()
 	defer p.viewMu.Unlock()
@@ -107,7 +111,7 @@ func (p *Platform) NotifyDirty(
 		return
 	}
 
-	if p.evaluateNode(entry, subLookup, geoLookup) {
+	if p.evaluateNode(entry, subLookup, geoLookup, resolveLatencyAuthorities(latencyAuthorities)) {
 		p.view.Add(h)
 	} else {
 		p.view.Remove(h)
@@ -119,6 +123,7 @@ func (p *Platform) evaluateNode(
 	entry *node.NodeEntry,
 	subLookup node.SubLookupFunc,
 	geoLookup GeoLookupFunc,
+	latencyAuthorities []string,
 ) bool {
 	// 0. Disabled nodes are never routable.
 	if entry.IsDisabledBySubscriptions(subLookup) {
@@ -153,8 +158,21 @@ func (p *Platform) evaluateNode(
 	if !entry.HasLatency() {
 		return false
 	}
+	if p.MaxReferenceLatencyMs > 0 {
+		latencyMs, ok := node.AverageEWMAForDomainsMs(entry, latencyAuthorities)
+		if !ok || latencyMs > p.MaxReferenceLatencyMs {
+			return false
+		}
+	}
 
 	return true
+}
+
+func resolveLatencyAuthorities(callbacks []func() []string) []string {
+	if len(callbacks) == 0 || callbacks[0] == nil {
+		return nil
+	}
+	return callbacks[0]()
 }
 
 // MatchRegionFilter applies include/exclude region filters.

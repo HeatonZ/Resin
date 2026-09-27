@@ -89,6 +89,18 @@ func (p mergePatch) optionalInt(field string) (int, bool, *ServiceError) {
 	return int(value), true, nil
 }
 
+func (p mergePatch) optionalFloat(field string) (float64, bool, *ServiceError) {
+	raw, ok := p[field]
+	if !ok {
+		return 0, false, nil
+	}
+	value, ok := raw.(float64)
+	if !ok || math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0, true, invalidArg(fmt.Sprintf("%s: must be a finite number", field))
+	}
+	return value, true, nil
+}
+
 func (p mergePatch) optionalStringSlice(field string) ([]string, bool, *ServiceError) {
 	raw, ok := p[field]
 	if !ok {

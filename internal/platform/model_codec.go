@@ -2,6 +2,7 @@ package platform
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"strings"
 
@@ -99,6 +100,9 @@ func CompileModelRegexFilters(platformID string, regexFilters []string) (node.Ta
 
 // BuildFromModel builds a runtime platform from a persisted model.Platform.
 func BuildFromModel(mp model.Platform) (*Platform, error) {
+	if math.IsNaN(mp.MaxReferenceLatencyMs) || math.IsInf(mp.MaxReferenceLatencyMs, 0) || mp.MaxReferenceLatencyMs < 0 {
+		return nil, fmt.Errorf("decode platform %s max_reference_latency_ms: must be a finite non-negative number", mp.ID)
+	}
 	regexFilters, err := CompileModelRegexFilters(mp.ID, mp.RegexFilters)
 	if err != nil {
 		return nil, err
@@ -130,7 +134,7 @@ func BuildFromModel(mp model.Platform) (*Platform, error) {
 		)
 	}
 
-	return NewConfiguredPlatform(
+	plat := NewConfiguredPlatform(
 		mp.ID,
 		mp.Name,
 		regexFilters,
@@ -141,5 +145,7 @@ func BuildFromModel(mp model.Platform) (*Platform, error) {
 		fixedHeader,
 		mp.AllocationPolicy,
 		mp.PassiveCircuitBreakerDisabled,
-	), nil
+	)
+	plat.MaxReferenceLatencyMs = mp.MaxReferenceLatencyMs
+	return plat, nil
 }

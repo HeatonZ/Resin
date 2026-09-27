@@ -165,6 +165,12 @@ Note: Once enabled, requests without authentication information are rejected ins
   "节点列表": "Node List",
   "连续失败": "Consecutive Failures",
   "参考延迟": "Reference Latency",
+  "参考延迟上限（可选，ms）": "Reference latency limit (optional, ms)",
+  "仅保留参考延迟不超过此值的节点；留空表示不限。":
+    "Only nodes at or below this reference latency are kept; leave empty for no limit.",
+  "最大参考延迟必须大于 0": "Maximum reference latency must be greater than 0",
+  "延迟上限": "Latency limit",
+  "不限": "No limit",
   "上次探测": "Last Probe",
   "上次检查": "Last Check",
   "上次更新": "Last Updated",

@@ -31,6 +31,10 @@ export const platformFormSchema = z.object({
       message: "平台名称不能为保留字",
     }),
   sticky_ttl: z.string().optional(),
+  max_reference_latency_ms: z.string().trim().refine(
+    (value) => value === "" || (Number.isFinite(Number(value)) && Number(value) > 0),
+    { message: "最大参考延迟必须大于 0" },
+  ),
   regex_filters_text: z.string().optional(),
   region_filters_text: z.string().optional(),
   reverse_proxy_miss_action: z.enum(missActions),
@@ -56,6 +60,7 @@ export type PlatformFormValues = z.infer<typeof platformFormSchema>;
 export const defaultPlatformFormValues: PlatformFormValues = {
   name: "",
   sticky_ttl: "",
+  max_reference_latency_ms: "",
   regex_filters_text: "",
   region_filters_text: "",
   reverse_proxy_miss_action: "TREAT_AS_EMPTY",
@@ -72,6 +77,8 @@ export function platformToFormValues(platform: Platform): PlatformFormValues {
   return {
     name: platform.name,
     sticky_ttl: platform.sticky_ttl,
+    max_reference_latency_ms:
+      platform.max_reference_latency_ms > 0 ? String(platform.max_reference_latency_ms) : "",
     regex_filters_text: regexFilters.join("\n"),
     region_filters_text: regionFilters.join("\n"),
     reverse_proxy_miss_action: platform.reverse_proxy_miss_action,
@@ -99,6 +106,7 @@ export function toPlatformCreateInput(values: PlatformFormValues): PlatformCreat
   return {
     ...toPlatformPayloadBase(values),
     sticky_ttl: values.sticky_ttl?.trim() || undefined,
+    max_reference_latency_ms: values.max_reference_latency_ms ? Number(values.max_reference_latency_ms) : undefined,
   };
 }
 
@@ -106,5 +114,6 @@ export function toPlatformUpdateInput(values: PlatformFormValues): PlatformUpdat
   return {
     ...toPlatformPayloadBase(values),
     sticky_ttl: values.sticky_ttl?.trim() || "",
+    max_reference_latency_ms: values.max_reference_latency_ms ? Number(values.max_reference_latency_ms) : 0,
   };
 }

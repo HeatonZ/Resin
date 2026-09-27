@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -26,6 +27,7 @@ type PlatformResponse struct {
 	StickyTTL                        string   `json:"sticky_ttl"`
 	RegexFilters                     []string `json:"regex_filters"`
 	RegionFilters                    []string `json:"region_filters"`
+	MaxReferenceLatencyMs            float64  `json:"max_reference_latency_ms"`
 	RoutableNodeCount                int      `json:"routable_node_count"`
 	ReverseProxyMissAction           string   `json:"reverse_proxy_miss_action"`
 	ReverseProxyEmptyAccountBehavior string   `json:"reverse_proxy_empty_account_behavior"`
@@ -44,6 +46,7 @@ func platformToResponse(p model.Platform) PlatformResponse {
 		StickyTTL:                        time.Duration(p.StickyTTLNs).String(),
 		RegexFilters:                     append([]string(nil), p.RegexFilters...),
 		RegionFilters:                    append([]string(nil), p.RegionFilters...),
+		MaxReferenceLatencyMs:            p.MaxReferenceLatencyMs,
 		RoutableNodeCount:                0,
 		ReverseProxyMissAction:           p.ReverseProxyMissAction,
 		ReverseProxyEmptyAccountBehavior: behavior,
@@ -71,6 +74,7 @@ type platformConfig struct {
 	StickyTTLNs                      int64
 	RegexFilters                     []string
 	RegionFilters                    []string
+	MaxReferenceLatencyMs            float64
 	ReverseProxyMissAction           string
 	ReverseProxyEmptyAccountBehavior string
 	ReverseProxyFixedAccountHeader   string
@@ -116,6 +120,7 @@ func platformConfigFromModel(mp model.Platform) platformConfig {
 		StickyTTLNs:                      mp.StickyTTLNs,
 		RegexFilters:                     append([]string(nil), mp.RegexFilters...),
 		RegionFilters:                    append([]string(nil), mp.RegionFilters...),
+		MaxReferenceLatencyMs:            mp.MaxReferenceLatencyMs,
 		ReverseProxyMissAction:           mp.ReverseProxyMissAction,
 		ReverseProxyEmptyAccountBehavior: normalizePlatformEmptyAccountBehavior(mp.ReverseProxyEmptyAccountBehavior),
 		ReverseProxyFixedAccountHeader:   normalizeHeaderFieldName(mp.ReverseProxyFixedAccountHeader),
@@ -131,6 +136,7 @@ func (cfg platformConfig) toModel(id string, updatedAtNs int64) model.Platform {
 		StickyTTLNs:                      cfg.StickyTTLNs,
 		RegexFilters:                     append([]string(nil), cfg.RegexFilters...),
 		RegionFilters:                    append([]string(nil), cfg.RegionFilters...),
+		MaxReferenceLatencyMs:            cfg.MaxReferenceLatencyMs,
 		ReverseProxyMissAction:           cfg.ReverseProxyMissAction,
 		ReverseProxyEmptyAccountBehavior: cfg.ReverseProxyEmptyAccountBehavior,
 		ReverseProxyFixedAccountHeader:   cfg.ReverseProxyFixedAccountHeader,
@@ -145,7 +151,7 @@ func (cfg platformConfig) toRuntime(id string) (*platform.Platform, error) {
 	if err != nil {
 		return nil, err
 	}
-	return platform.NewConfiguredPlatform(
+	plat := platform.NewConfiguredPlatform(
 		id,
 		cfg.Name,
 		compiledRegexFilters,
@@ -156,7 +162,16 @@ func (cfg platformConfig) toRuntime(id string) (*platform.Platform, error) {
 		cfg.ReverseProxyFixedAccountHeader,
 		cfg.AllocationPolicy,
 		cfg.PassiveCircuitBreakerDisabled,
-	), nil
+	)
+	plat.MaxReferenceLatencyMs = cfg.MaxReferenceLatencyMs
+	return plat, nil
+}
+
+func validatePlatformLatencyLimit(value float64) *ServiceError {
+	if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+		return invalidArg("max_reference_latency_ms: must be a finite non-negative number")
+	}
+	return nil
 }
 
 func validatePlatformMissAction(raw string) *ServiceError {
@@ -329,6 +344,7 @@ type CreatePlatformRequest struct {
 	StickyTTL                        *string  `json:"sticky_ttl"`
 	RegexFilters                     []string `json:"regex_filters"`
 	RegionFilters                    []string `json:"region_filters"`
+	MaxReferenceLatencyMs            *float64 `json:"max_reference_latency_ms"`
 	ReverseProxyMissAction           *string  `json:"reverse_proxy_miss_action"`
 	ReverseProxyEmptyAccountBehavior *string  `json:"reverse_proxy_empty_account_behavior"`
 	ReverseProxyFixedAccountHeader   *string  `json:"reverse_proxy_fixed_account_header"`
@@ -369,6 +385,12 @@ func (s *ControlPlaneService) CreatePlatform(req CreatePlatformRequest) (*Platfo
 	}
 	if req.RegionFilters != nil {
 		cfg.RegionFilters = req.RegionFilters
+	}
+	if req.MaxReferenceLatencyMs != nil {
+		if err := validatePlatformLatencyLimit(*req.MaxReferenceLatencyMs); err != nil {
+			return nil, err
+		}
+		cfg.MaxReferenceLatencyMs = *req.MaxReferenceLatencyMs
 	}
 	if req.ReverseProxyMissAction != nil {
 		if err := setPlatformMissAction(&cfg, *req.ReverseProxyMissAction); err != nil {
@@ -474,6 +496,14 @@ func (s *ControlPlaneService) UpdatePlatform(id string, patchJSON json.RawMessag
 	} else if ok {
 		regionFiltersPatched = true
 		cfg.RegionFilters = filters
+	}
+	if maxLatency, ok, err := patch.optionalFloat("max_reference_latency_ms"); err != nil {
+		return nil, err
+	} else if ok {
+		if err := validatePlatformLatencyLimit(maxLatency); err != nil {
+			return nil, err
+		}
+		cfg.MaxReferenceLatencyMs = maxLatency
 	}
 
 	if ma, ok, err := patch.optionalString("reverse_proxy_miss_action"); err != nil {

@@ -205,6 +205,10 @@ export function PlatformPage() {
                     <span>{t("租约时长")}</span>
                     <strong>{stickyTTL}</strong>
                   </span>
+                  <span className="platform-fact">
+                    <span>{t("延迟上限")}</span>
+                    <strong>{platform.max_reference_latency_ms > 0 ? `${platform.max_reference_latency_ms} ms` : t("不限")}</strong>
+                  </span>
                 </div>
                 <div className="platform-tile-foot">
                   <span className="platform-tile-meta">
@@ -259,6 +263,27 @@ export function PlatformPage() {
                   {t("租约保持时长（可选）")}
                 </label>
                 <Input id="create-sticky" placeholder={t("例如 168h")} {...createForm.register("sticky_ttl")} />
+              </div>
+
+              <div className="field-group">
+                <label className="field-label" htmlFor="create-max-reference-latency">
+                  {t("参考延迟上限（可选，ms）")}
+                </label>
+                <Input
+                  id="create-max-reference-latency"
+                  type="number"
+                  min="1"
+                  step="any"
+                  placeholder={t("例如 500")}
+                  invalid={Boolean(createForm.formState.errors.max_reference_latency_ms)}
+                  {...createForm.register("max_reference_latency_ms")}
+                />
+                {createForm.formState.errors.max_reference_latency_ms?.message ? (
+                  <p className="field-error">{t(createForm.formState.errors.max_reference_latency_ms.message)}</p>
+                ) : null}
+                <p className="muted" style={{ marginTop: 4, fontSize: 12 }}>
+                  {t("仅保留参考延迟不超过此值的节点；留空表示不限。")}
+                </p>
               </div>
 
               <div className="field-group">

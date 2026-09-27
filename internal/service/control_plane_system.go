@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -96,6 +97,7 @@ var platformPatchAllowedFields = map[string]bool{
 	"sticky_ttl":                           true,
 	"regex_filters":                        true,
 	"region_filters":                       true,
+	"max_reference_latency_ms":             true,
 	"reverse_proxy_miss_action":            true,
 	"reverse_proxy_empty_account_behavior": true,
 	"reverse_proxy_fixed_account_header":   true,
@@ -157,7 +159,8 @@ func (s *ControlPlaneService) PatchRuntimeConfig(patchJSON json.RawMessage) (*co
 	defer s.configMu.Unlock()
 
 	// 3. Deep-copy current config → apply patch.
-	newCfg := copyRuntimeConfig(s.RuntimeCfg.Load())
+	previousCfg := copyRuntimeConfig(s.RuntimeCfg.Load())
+	newCfg := copyRuntimeConfig(previousCfg)
 	if verr := parseRuntimeConfigPatch(patchJSON, newCfg); verr != nil {
 		return nil, verr
 	}
@@ -188,6 +191,9 @@ func (s *ControlPlaneService) PatchRuntimeConfig(patchJSON json.RawMessage) (*co
 	// 6. Atomic swap.
 	s.RuntimeCfg.Store(newCfg)
 	s.configVersion = newVersion
+	if s.Pool != nil && !slices.Equal(previousCfg.LatencyAuthorities, newCfg.LatencyAuthorities) {
+		s.Pool.RebuildAllPlatforms()
+	}
 
 	return newCfg, nil
 }
