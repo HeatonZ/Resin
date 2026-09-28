@@ -199,7 +199,7 @@ func (r *Router) decideStickyLease(
 		if newLease, hitResult, ok := r.tryLeaseHit(plat, account, current, nowNs); ok {
 			return newLease, xsync.UpdateOp, hitResult, nil
 		}
-		if newLease, rotatedResult, ok := r.tryLeaseSameIPRotation(plat, account, current, targetDomain, nowNs); ok {
+		if newLease, rotatedResult, ok := r.tryLeaseSameIPRotation(plat, account, state.NodeAllocationHistory, current, targetDomain, nowNs); ok {
 			return newLease, xsync.UpdateOp, rotatedResult, nil
 		}
 		invalidation = leaseInvalidationRemove
@@ -238,6 +238,7 @@ func (r *Router) createOrAbortStickyLease(
 
 	r.cleanupPreviousLease(state, previous, hadPreviousLease, invalidation, plat.ID, account)
 	state.IPLoadStats.Inc(newLease.EgressIP)
+	state.NodeAllocationHistory.Record(newLease.NodeHash, nowNs)
 	r.emitLeaseEvent(LeaseEvent{
 		Type:       LeaseCreate,
 		PlatformID: plat.ID,
@@ -278,6 +279,7 @@ func (r *Router) tryLeaseHit(
 func (r *Router) tryLeaseSameIPRotation(
 	plat *platform.Platform,
 	account string,
+	history *NodeAllocationHistory,
 	current Lease,
 	targetDomain string,
 	nowNs int64,
@@ -289,6 +291,7 @@ func (r *Router) tryLeaseSameIPRotation(
 		targetDomain,
 		r.authorities(),
 		r.p2cWindow(),
+		history,
 	)
 	if !ok {
 		return Lease{}, RouteResult{}, false
@@ -297,6 +300,7 @@ func (r *Router) tryLeaseSameIPRotation(
 	newLease := current
 	newLease.NodeHash = bestHash
 	newLease.LastAccessedNs = nowNs
+	history.Record(bestHash, nowNs)
 	r.emitLeaseEvent(LeaseEvent{
 		Type:       LeaseReplace,
 		PlatformID: plat.ID,
@@ -318,7 +322,7 @@ func (r *Router) createLease(
 	now time.Time,
 	nowNs int64,
 ) (Lease, RouteResult, error) {
-	h, entry, err := r.selectLiveRandomRoute(plat, state.IPLoadStats, targetDomain)
+	h, entry, err := r.selectLiveRandomRoute(plat, state.IPLoadStats, targetDomain, state.NodeAllocationHistory)
 	if err != nil {
 		return Lease{}, RouteResult{}, err
 	}
@@ -392,10 +396,11 @@ func (r *Router) selectLiveRandomRoute(
 	plat *platform.Platform,
 	stats *IPLoadStats,
 	targetDomain string,
+	histories ...*NodeAllocationHistory,
 ) (node.Hash, *node.NodeEntry, error) {
 	var lastMissing node.Hash
 	for i := 0; i < livePickAttempts; i++ {
-		h, err := randomRoute(plat, stats, r.pool, targetDomain, r.authorities(), r.p2cWindow())
+		h, err := randomRoute(plat, stats, r.pool, targetDomain, r.authorities(), r.p2cWindow(), histories...)
 		if err != nil {
 			return node.Zero, nil, err
 		}
@@ -418,10 +423,19 @@ func chooseSameIPRotationCandidate(
 	targetDomain string,
 	authorities []string,
 	window time.Duration,
+	histories ...*NodeAllocationHistory,
 ) (node.Hash, bool) {
 	bestKnownHash := node.Zero
 	bestKnownLatency := time.Duration(math.MaxInt64)
 	fallbackHash := node.Zero
+	bestFreshKnownHash := node.Zero
+	bestFreshKnownLatency := time.Duration(math.MaxInt64)
+	freshFallbackHash := node.Zero
+	var history *NodeAllocationHistory
+	if len(histories) > 0 {
+		history = histories[0]
+	}
+	nowNs := time.Now().UnixNano()
 
 	plat.View().Range(func(h node.Hash) bool {
 		entry, ok := pool.GetEntry(h)
@@ -431,14 +445,29 @@ func chooseSameIPRotationCandidate(
 		if fallbackHash == node.Zero {
 			fallbackHash = h
 		}
+		fresh := !history.WasRecentlyAllocated(h, nowNs)
+		if fresh && freshFallbackHash == node.Zero {
+			freshFallbackHash = h
+		}
 
 		latency, hasLatency := sameIPCandidateLatency(entry, targetDomain, authorities, window)
 		if hasLatency && latency < bestKnownLatency {
 			bestKnownLatency = latency
 			bestKnownHash = h
 		}
+		if fresh && hasLatency && latency < bestFreshKnownLatency {
+			bestFreshKnownLatency = latency
+			bestFreshKnownHash = h
+		}
 		return true
 	})
+
+	if plat.AllocationPolicy == platform.AllocationPolicyPreferLowLatencyAndIdle && freshFallbackHash != node.Zero {
+		if bestFreshKnownHash != node.Zero {
+			return bestFreshKnownHash, true
+		}
+		return freshFallbackHash, true
+	}
 
 	if bestKnownHash != node.Zero {
 		return bestKnownHash, true
@@ -526,6 +555,7 @@ func (r *Router) UpsertLease(ml model.Lease) error {
 		state.Leases.stats.Inc(lease.EgressIP)
 		return lease, xsync.UpdateOp
 	})
+	state.NodeAllocationHistory.Record(h, time.Now().UnixNano())
 
 	r.emitLeaseEvent(LeaseEvent{
 		Type:       eventType,
@@ -572,6 +602,7 @@ func (r *Router) RestoreLeases(leases []model.Lease) {
 		}
 		// Directly insert into table and stats
 		state.Leases.CreateLease(ml.Account, l)
+		state.NodeAllocationHistory.Record(h, ml.CreatedAtNs)
 	}
 }
 

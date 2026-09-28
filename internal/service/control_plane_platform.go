@@ -231,10 +231,11 @@ func validatePlatformAllocationPolicy(raw string) *ServiceError {
 		return nil
 	}
 	return invalidArg(fmt.Sprintf(
-		"allocation_policy: must be %s, %s, or %s",
+		"allocation_policy: must be %s, %s, %s, or %s",
 		platform.AllocationPolicyBalanced,
 		platform.AllocationPolicyPreferLowLatency,
 		platform.AllocationPolicyPreferIdleIP,
+		platform.AllocationPolicyPreferLowLatencyAndIdle,
 	))
 }
 

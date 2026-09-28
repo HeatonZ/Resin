@@ -362,6 +362,7 @@ Note: Once enabled, requests without authentication information are rejected ins
   "均衡": "Balanced",
   "优先低延迟": "Prefer low latency",
   "优先空闲出口 IP": "Prefer idle egress IP",
+  "低延迟优先（避开近 1 小时分配节点）": "Prefer low latency and avoid nodes allocated in the last hour",
   "租约保持时长": "Lease Sticky TTL",
   "租约保持时长（可选）": "Lease Sticky TTL (optional)",
   "节点名正则过滤规则": "Node name regex filters",

@@ -19,8 +19,8 @@ var randomRouteRNGPool = sync.Pool{
 }
 
 // randomRoute selects a routable node using P2C with latency/load scoring.
-// It intentionally trusts Platform.View as the routable source of truth and
-// does not do extra pool scans/availability validation on the hot path.
+// The cooldown policy scans the routable view to sample only nodes outside its
+// one-hour allocation window when any such node exists.
 // Post-pick race handling (node removed right after selection) is handled by
 // the caller in RouteRequest.
 func randomRoute(
@@ -30,6 +30,7 @@ func randomRoute(
 	targetDomain string,
 	authorities []string,
 	p2cWindow time.Duration,
+	histories ...*NodeAllocationHistory,
 ) (node.Hash, error) {
 	view := plat.View()
 	size := view.Size()
@@ -39,6 +40,40 @@ func randomRoute(
 
 	rng := randomRouteRNGPool.Get().(*rand.Rand)
 	defer randomRouteRNGPool.Put(rng)
+
+	if plat.AllocationPolicy == platform.AllocationPolicyPreferLowLatencyAndIdle && len(histories) > 0 {
+		var freshFirst, freshSecond node.Hash
+		var freshCount int
+		var liveFirst, liveSecond node.Hash
+		var liveCount int
+		nowNs := time.Now().UnixNano()
+		view.Range(func(candidate node.Hash) bool {
+			if _, ok := pool.GetEntry(candidate); !ok {
+				return true
+			}
+			liveCount++
+			samplePair(rng, candidate, liveCount, &liveFirst, &liveSecond)
+			if histories[0].WasRecentlyAllocated(candidate, nowNs) {
+				return true
+			}
+			freshCount++
+			samplePair(rng, candidate, freshCount, &freshFirst, &freshSecond)
+			return true
+		})
+		if freshCount == 1 {
+			return freshFirst, nil
+		}
+		if freshCount >= 2 {
+			return chooseByScore(freshFirst, freshSecond, plat, stats, pool, targetDomain, authorities, p2cWindow)
+		}
+		if liveCount == 1 {
+			return liveFirst, nil
+		}
+		if liveCount >= 2 {
+			return chooseByScore(liveFirst, liveSecond, plat, stats, pool, targetDomain, authorities, p2cWindow)
+		}
+		return node.Zero, ErrNoAvailableNodes
+	}
 
 	pick := func() (node.Hash, bool) {
 		return view.RandomPick(rng)
@@ -76,19 +111,42 @@ func randomRoute(
 		}
 	}
 
-	// Determine effective latency for comparison.
-	lat1, lat2 := compareLatencies(h1, h2, pool, targetDomain, authorities, p2cWindow)
+	return chooseByScore(h1, h2, plat, stats, pool, targetDomain, authorities, p2cWindow)
+}
 
-	// Calculate scores.
+func samplePair(rng *rand.Rand, candidate node.Hash, count int, first, second *node.Hash) {
+	switch count {
+	case 1:
+		*first = candidate
+	case 2:
+		*second = candidate
+	default:
+		if index := rng.IntN(count); index < 2 {
+			if index == 0 {
+				*first = candidate
+			} else {
+				*second = candidate
+			}
+		}
+	}
+}
+
+func chooseByScore(
+	h1, h2 node.Hash,
+	plat *platform.Platform,
+	stats *IPLoadStats,
+	pool PoolAccessor,
+	targetDomain string,
+	authorities []string,
+	p2cWindow time.Duration,
+) (node.Hash, error) {
+	lat1, lat2 := compareLatencies(h1, h2, pool, targetDomain, authorities, p2cWindow)
 	s1 := calculateScore(h1, lat1, plat, stats, pool)
 	s2 := calculateScore(h2, lat2, plat, stats, pool)
-
-	// Lower score is better.
-	selected := h2 // favor h2 on tie
 	if s1 < s2 {
-		selected = h1
+		return h1, nil
 	}
-	return selected, nil
+	return h2, nil // favor h2 on tie
 }
 
 // compareLatencies determines the latency values for h1 and h2.
@@ -164,6 +222,8 @@ func calculateScore(
 	// Policy-based scoring.
 	switch plat.AllocationPolicy {
 	case platform.AllocationPolicyPreferLowLatency:
+		return float64(latency)
+	case platform.AllocationPolicyPreferLowLatencyAndIdle:
 		return float64(latency)
 	case platform.AllocationPolicyPreferIdleIP:
 		return float64(leaseCount)

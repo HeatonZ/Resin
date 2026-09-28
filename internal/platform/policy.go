@@ -4,9 +4,10 @@ package platform
 type AllocationPolicy string
 
 const (
-	AllocationPolicyBalanced         AllocationPolicy = "BALANCED"
-	AllocationPolicyPreferLowLatency AllocationPolicy = "PREFER_LOW_LATENCY"
-	AllocationPolicyPreferIdleIP     AllocationPolicy = "PREFER_IDLE_IP"
+	AllocationPolicyBalanced                AllocationPolicy = "BALANCED"
+	AllocationPolicyPreferLowLatency        AllocationPolicy = "PREFER_LOW_LATENCY"
+	AllocationPolicyPreferIdleIP            AllocationPolicy = "PREFER_IDLE_IP"
+	AllocationPolicyPreferLowLatencyAndIdle AllocationPolicy = "PREFER_LOW_LATENCY_AND_IDLE"
 )
 
 // ParseAllocationPolicy normalizes external string input into a supported policy.
@@ -21,7 +22,8 @@ func ParseAllocationPolicy(raw string) AllocationPolicy {
 
 func (p AllocationPolicy) IsValid() bool {
 	switch p {
-	case AllocationPolicyBalanced, AllocationPolicyPreferLowLatency, AllocationPolicyPreferIdleIP:
+	case AllocationPolicyBalanced, AllocationPolicyPreferLowLatency, AllocationPolicyPreferIdleIP,
+		AllocationPolicyPreferLowLatencyAndIdle:
 		return true
 	default:
 		return false

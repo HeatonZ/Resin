@@ -8,6 +8,7 @@ export const allocationPolicies: PlatformAllocationPolicy[] = [
   "BALANCED",
   "PREFER_LOW_LATENCY",
   "PREFER_IDLE_IP",
+  "PREFER_LOW_LATENCY_AND_IDLE",
 ];
 
 export const missActions: PlatformMissAction[] = ["TREAT_AS_EMPTY", "REJECT"];
@@ -22,6 +23,7 @@ export const allocationPolicyLabel: Record<PlatformAllocationPolicy, string> = {
   BALANCED: "均衡",
   PREFER_LOW_LATENCY: "优先低延迟",
   PREFER_IDLE_IP: "优先空闲出口 IP",
+  PREFER_LOW_LATENCY_AND_IDLE: "低延迟优先（避开近 1 小时分配节点）",
 };
 
 export const missActionLabel: Record<PlatformMissAction, string> = {
