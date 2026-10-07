@@ -3,6 +3,7 @@ package routing
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/netip"
 	"sync/atomic"
 	"testing"
@@ -57,6 +58,29 @@ func (p *transientMissingPool) GetPlatformByName(name string) (*platform.Platfor
 
 func (p *transientMissingPool) RangePlatforms(fn func(*platform.Platform) bool) {
 	p.inner.RangePlatforms(fn)
+}
+
+func TestRandomRoute_LowLatencyIdleChecksBoundedCandidates(t *testing.T) {
+	basePool := newRouterTestPool()
+	plat := platform.NewPlatform("plat-bounded-sampling", "Plat-Bounded-Sampling", nil, nil)
+	plat.AllocationPolicy = platform.AllocationPolicyPreferLowLatencyAndIdle
+	basePool.addPlatform(plat)
+
+	for i := 0; i < 512; i++ {
+		raw := fmt.Sprintf(`{"id":"bounded-%d"}`, i)
+		h, entry := newRoutableEntry(t, raw, fmt.Sprintf("198.51.%d.%d", (i/250)+1, (i%250)+1))
+		basePool.addEntry(h, entry)
+	}
+	basePool.rebuildPlatformView(plat)
+
+	counted := &getEntryCountPool{inner: basePool}
+	_, err := randomRoute(plat, NewIPLoadStats(), counted, "example.com", nil, time.Minute, NewNodeAllocationHistory())
+	if err != nil {
+		t.Fatalf("randomRoute: %v", err)
+	}
+	if counted.getCalls > maxLowLatencyIdleSamples+4 {
+		t.Fatalf("candidate lookups grew with pool size: got %d, bound %d", counted.getCalls, maxLowLatencyIdleSamples+4)
+	}
 }
 
 func TestRouteRequest_DefaultPlatformRequiresWellKnownID(t *testing.T) {

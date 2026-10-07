@@ -10,6 +10,8 @@ import (
 	"github.com/Resinat/Resin/internal/platform"
 )
 
+const maxLowLatencyIdleSamples = 16
+
 var ErrNoAvailableNodes = errors.New("no available nodes")
 
 var randomRouteRNGPool = sync.Pool{
@@ -46,20 +48,29 @@ func randomRoute(
 		var freshCount int
 		var liveFirst, liveSecond node.Hash
 		var liveCount int
+		var attempts int
+		seen := make(map[node.Hash]struct{}, maxLowLatencyIdleSamples)
 		nowNs := time.Now().UnixNano()
-		view.Range(func(candidate node.Hash) bool {
+		for attempts = 0; attempts < maxLowLatencyIdleSamples && attempts < size; attempts++ {
+			candidate, ok := view.RandomPick(rng)
+			if !ok {
+				break
+			}
+			if _, duplicate := seen[candidate]; duplicate {
+				continue
+			}
+			seen[candidate] = struct{}{}
 			if _, ok := pool.GetEntry(candidate); !ok {
-				return true
+				continue
 			}
 			liveCount++
 			samplePair(rng, candidate, liveCount, &liveFirst, &liveSecond)
 			if histories[0].WasRecentlyAllocated(candidate, nowNs) {
-				return true
+				continue
 			}
 			freshCount++
 			samplePair(rng, candidate, freshCount, &freshFirst, &freshSecond)
-			return true
-		})
+		}
 		if freshCount == 1 {
 			return freshFirst, nil
 		}

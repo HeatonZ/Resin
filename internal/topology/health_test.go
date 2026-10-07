@@ -38,6 +38,33 @@ func addTestNode(pool *GlobalNodePool, sub *subscription.Subscription, raw strin
 
 // --- RecordResult tests ---
 
+func TestRecordLatency_ReferenceFilterReevaluatesOnlyFilteredPlatforms(t *testing.T) {
+	pool, subMgr := newHealthTestPool(3)
+	sub := subMgr.Lookup("s1")
+	h := addTestNode(pool, sub, `{"type":"ss","n":"latency-filter-scope"}`)
+	entry, ok := pool.GetEntry(h)
+	if !ok {
+		t.Fatal("node missing")
+	}
+	pool.RecordResult(h, true)
+	entry.SetEgressIP(netip.MustParseAddr("203.0.113.44"))
+
+	plain := platform.NewPlatform("plain", "Plain", nil, nil)
+	filtered := platform.NewPlatform("filtered", "Filtered", nil, nil)
+	filtered.MaxReferenceLatencyMs = 200
+	pool.RegisterPlatform(plain)
+	pool.RegisterPlatform(filtered)
+
+	latency := 20 * time.Millisecond
+	pool.RecordLatency(h, "example.com", &latency)
+	if plain.View().Contains(h) {
+		t.Fatal("unfiltered platform should retain existing no-latency routability behavior")
+	}
+	if filtered.View().Contains(h) {
+		t.Fatal("filtered platform must not route before a reference-latency sample exists")
+	}
+}
+
 func TestRecordResult_CircuitBreak(t *testing.T) {
 	pool, subMgr := newHealthTestPool(3) // break after 3 failures
 	sub := subMgr.Lookup("s1")

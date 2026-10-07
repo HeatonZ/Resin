@@ -621,10 +621,12 @@ func (p *GlobalNodePool) RecordLatency(hash node.Hash, rawTarget string, latency
 
 	wasEmpty, evictedDomain, evicted := entry.LatencyTable.UpdateClassified(domain, *latency, decayWindow, isAuthority)
 
-	// If the table transitioned from empty to non-empty, the node might
-	// now satisfy the HasLatency filter — notify platforms.
-	if wasEmpty || (isAuthority && p.hasReferenceLatencyFilteredPlatform()) {
+	// A latency-filtered platform must be re-evaluated when an authority sample
+	// changes. Platforms without a reference-latency limit do not depend on it.
+	if wasEmpty {
 		p.notifyAllPlatformsDirty(hash)
+	} else if isAuthority {
+		p.notifyLatencyFilteredPlatformsDirty(hash)
 	}
 
 	if p.onNodeLatencyChanged != nil {
@@ -635,13 +637,27 @@ func (p *GlobalNodePool) RecordLatency(hash node.Hash, rawTarget string, latency
 	}
 }
 
-func (p *GlobalNodePool) hasReferenceLatencyFilteredPlatform() bool {
-	for _, plat := range p.platformSnapshot() {
+// notifyLatencyFilteredPlatformsDirty re-evaluates only platforms whose
+// routable view depends on reference latency samples.
+func (p *GlobalNodePool) notifyLatencyFilteredPlatformsDirty(hash node.Hash) {
+	platforms := p.platformSnapshot()
+	filtered := make([]*platform.Platform, 0, len(platforms))
+	for _, plat := range platforms {
 		if plat.MaxReferenceLatencyMs > 0 {
-			return true
+			filtered = append(filtered, plat)
 		}
 	}
-	return false
+	if len(filtered) == 0 {
+		return
+	}
+
+	subLookup := p.MakeSubLookup()
+	getEntry := func(h node.Hash) (*node.NodeEntry, bool) {
+		return p.nodes.Load(h)
+	}
+	for _, plat := range filtered {
+		plat.NotifyDirty(hash, getEntry, subLookup, p.geoLookup, p.latencyAuthorities)
+	}
 }
 
 // UpdateNodeEgressIP records an egress probe attempt and optionally updates
