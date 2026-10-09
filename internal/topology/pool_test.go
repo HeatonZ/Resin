@@ -26,6 +26,198 @@ func newTestPool(subMgr *SubscriptionManager) *GlobalNodePool {
 	})
 }
 
+// --- Async platform dirty notification tests ---
+
+// With the drainer running, probe/health feedback must not block the caller,
+// and the notification must still be applied (never silently dropped).
+func TestMarkNodeDirtyAsync_DoesNotBlockAndConverges(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s1", "Sub1", "url", true, false)
+	subMgr.Register(sub)
+
+	// First geo lookup blocks until released, so the drainer is parked inside
+	// an evaluation when the hot-path call below fires.
+	releaseGeoLookup := make(chan struct{})
+	firstLookup := make(chan struct{})
+	var lookupCalls atomic.Int32
+	pool := NewGlobalNodePool(PoolConfig{
+		SubLookup: subMgr.Lookup,
+		GeoLookup: func(netip.Addr) string {
+			if lookupCalls.Add(1) == 1 {
+				close(firstLookup)
+				<-releaseGeoLookup
+			}
+			return "us"
+		},
+		MaxLatencyTableEntries: 16,
+		MaxConsecutiveFailures: func() int { return 3 },
+	})
+	pool.StartPlatformDirtyWorker()
+	t.Cleanup(pool.ClosePlatformDirtyWorker)
+
+	// Two platforms, one drain pass must fan out to both.
+	pool.RegisterPlatform(platform.NewPlatform("p1", "P1", nil, []string{"us"}))
+	pool.RegisterPlatform(platform.NewPlatform("p2", "P2", nil, []string{"us"}))
+
+	raw := json.RawMessage(`{"type":"ss","server":"7.7.7.7"}`)
+	h := node.HashFromRawOptions(raw)
+	mn := subscription.NewManagedNodes()
+	mn.StoreNode(h, subscription.ManagedNode{Tags: []string{"n"}})
+	sub.SwapManagedNodes(mn)
+	pool.AddNodeFromSub(h, raw, "s1")
+
+	entry, _ := pool.GetEntry(h)
+	entry.LatencyTable.LoadEntry("example.com", node.DomainLatencyStats{
+		Ewma: 100 * time.Millisecond, LastUpdated: time.Now(),
+	})
+	ob := testutil.NewNoopOutbound()
+	entry.Outbound.Store(&ob)
+	entry.SetEgressIP(netip.MustParseAddr("1.2.3.4"))
+
+	// Make the node healthy first (clears the initial circuit-open), which
+	// queues the first dirty notification the drainer will get stuck on.
+	pool.RecordResult(h, true)
+
+	select {
+	case <-firstLookup:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drainer never entered the blocked evaluation")
+	}
+
+	// Now open the circuit through the hot path while the drainer is blocked.
+	// A synchronous implementation would deadlock here.
+	returned := make(chan struct{})
+	go func() {
+		pool.RecordResult(h, false)
+		pool.RecordResult(h, false)
+		pool.RecordResult(h, false)
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RecordResult blocked on platform view evaluation")
+	}
+	if !entry.IsCircuitOpen() {
+		t.Fatal("test setup: circuit should be open after 3 failures")
+	}
+
+	// Release the drainer and wait for every queued notification to be applied.
+	close(releaseGeoLookup)
+	pool.FlushPlatformDirty()
+
+	// The queued circuit-open notification must have been applied by the
+	// drainer (not dropped while it was blocked): both views lose the node.
+	if p1, ok := pool.GetPlatform("p1"); !ok || p1.View().Size() != 0 {
+		t.Fatal("circuit-broken node should be out of both platform views")
+	}
+	if p2, ok := pool.GetPlatform("p2"); !ok || p2.View().Size() != 0 {
+		t.Fatal("circuit-broken node should be out of both platform views")
+	}
+}
+
+// Without a drainer the async helpers must fall back to an inline apply, so
+// behaviour is identical to the synchronous implementation.
+func TestMarkNodeDirtyAsync_WithoutDrainerAppliesInline(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s1", "Sub1", "url", true, false)
+	subMgr.Register(sub)
+
+	pool := newTestPool(subMgr) // no drainer started
+	plat := platform.NewPlatform("p1", "P1", nil, nil)
+	pool.RegisterPlatform(plat)
+
+	raw := json.RawMessage(`{"type":"ss","server":"8.8.4.4"}`)
+	h := node.HashFromRawOptions(raw)
+	mn := subscription.NewManagedNodes()
+	mn.StoreNode(h, subscription.ManagedNode{Tags: []string{"n"}})
+	sub.SwapManagedNodes(mn)
+	pool.AddNodeFromSub(h, raw, "s1")
+
+	entry, _ := pool.GetEntry(h)
+	entry.LatencyTable.LoadEntry("example.com", node.DomainLatencyStats{
+		Ewma: 10 * time.Millisecond, LastUpdated: time.Now(),
+	})
+	ob := testutil.NewNoopOutbound()
+	entry.Outbound.Store(&ob)
+	entry.SetEgressIP(netip.MustParseAddr("5.6.7.8"))
+
+	pool.RecordResult(h, true)
+	if plat.View().Size() != 1 {
+		t.Fatal("without a drainer the notification must be applied inline")
+	}
+
+	pool.RecordResult(h, false)
+	pool.RecordResult(h, false)
+	pool.RecordResult(h, false)
+	if plat.View().Size() != 0 {
+		t.Fatal("inline fallback must still remove a circuit-broken node")
+	}
+}
+
+// A latency-filtered platform must be re-evaluated for authority latency
+// samples, while latency-agnostic platforms must NOT be (the v1.2.3
+// optimisation) once the drainer is running.
+func TestMarkNodeFilteredDirtyAsync_OnlyLatencyFilteredPlatforms(t *testing.T) {
+	subMgr := NewSubscriptionManager()
+	sub := subscription.NewSubscription("s1", "Sub1", "url", true, false)
+	subMgr.Register(sub)
+
+	var geoCalls atomic.Int32
+	pool := NewGlobalNodePool(PoolConfig{
+		SubLookup: subMgr.Lookup,
+		GeoLookup: func(netip.Addr) string {
+			geoCalls.Add(1)
+			return "us"
+		},
+		MaxLatencyTableEntries: 16,
+		MaxConsecutiveFailures: func() int { return 3 },
+		LatencyAuthorities:     func() []string { return []string{"gstatic.com"} },
+	})
+	pool.StartPlatformDirtyWorker()
+	t.Cleanup(pool.ClosePlatformDirtyWorker)
+
+	filtered := platform.NewPlatform("p1", "Filtered", nil, []string{"us"})
+	filtered.MaxReferenceLatencyMs = 200
+	plain := platform.NewPlatform("p2", "Plain", nil, []string{"us"}) // no latency limit
+	pool.RegisterPlatform(filtered)
+	pool.RegisterPlatform(plain)
+
+	raw := json.RawMessage(`{"type":"ss","server":"9.9.9.9"}`)
+	h := node.HashFromRawOptions(raw)
+	mn := subscription.NewManagedNodes()
+	mn.StoreNode(h, subscription.ManagedNode{Tags: []string{"n"}})
+	sub.SwapManagedNodes(mn)
+	pool.AddNodeFromSub(h, raw, "s1")
+	entry, _ := pool.GetEntry(h)
+	entry.LatencyTable.LoadEntry("gstatic.com", node.DomainLatencyStats{
+		Ewma: 10 * time.Millisecond, LastUpdated: time.Now(),
+	})
+	ob := testutil.NewNoopOutbound()
+	entry.Outbound.Store(&ob)
+	entry.SetEgressIP(netip.MustParseAddr("1.2.3.4"))
+	pool.RecordResult(h, true)
+	pool.FlushPlatformDirty()
+	if filtered.View().Size() != 1 || plain.View().Size() != 1 {
+		t.Fatalf("both platforms should hold the node initially (f=%d p=%d)",
+			filtered.View().Size(), plain.View().Size())
+	}
+
+	baseline := geoCalls.Load()
+
+	// Authority sample on a non-empty table -> filtered-only path.
+	lat := 20 * time.Millisecond
+	pool.RecordLatency(h, "gstatic.com", &lat)
+	pool.FlushPlatformDirty()
+
+	if got := geoCalls.Load() - baseline; got != 1 {
+		t.Fatalf("expected exactly 1 platform re-evaluated (the latency-filtered one), got %d", got)
+	}
+	if filtered.View().Size() != 1 {
+		t.Fatal("latency-filtered platform should still hold the node")
+	}
+}
+
 // --- Pool tests ---
 
 func TestPool_AddNodeFromSub_Idempotent(t *testing.T) {

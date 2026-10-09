@@ -4,6 +4,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/zeebo/xxh3"
@@ -21,7 +22,7 @@ type latencySlot struct {
 	key          uint64
 	domain       string
 	stats        DomainLatencyStats
-	lastAccessNs int64
+	lastAccessNs atomic.Int64
 	occupied     bool
 }
 
@@ -35,8 +36,12 @@ type latencyEntry struct {
 // bounded partition evicted by least-recently-accessed timestamp.
 // Domain lookup inside the table uses a 64-bit xxh3 hash key for compactness.
 // This intentionally accepts extremely low-probability hash collisions.
+//
+// mu is an RWMutex: the two read paths (GetDomainStats, Size) take RLock and
+// keep reads of lastAccessNs atomic, so routing reads no longer serialise
+// against each other or against latency writers on the same node.
 type LatencyTable struct {
-	mu sync.Mutex
+	mu sync.RWMutex
 
 	authorities []latencySlot
 	regular     []latencySlot
@@ -99,20 +104,22 @@ func (t *LatencyTable) UpdateClassified(
 // GetDomainStats returns the latency stats for a domain, if present.
 // Read touches are write-throttled: last-access timestamp is updated only when
 // the last update is older than latencyReadTouchMinInterval.
+//
+// Read-only fast path: takes RLock and updates lastAccessNs atomically, so it
+// does not exclude concurrent readers (the previous version took the write
+// lock, serialising every read against each other and against writers).
 func (t *LatencyTable) GetDomainStats(domain string) (DomainLatencyStats, bool) {
 	key := domainKey(domain)
 	nowNs := time.Now().UnixNano()
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 
 	for i := range t.authorities {
 		if !t.authorities[i].occupied || t.authorities[i].key != key {
 			continue
 		}
 		stats := t.authorities[i].stats
-		if nowNs-t.authorities[i].lastAccessNs >= latencyReadTouchMinInterval.Nanoseconds() {
-			t.authorities[i].lastAccessNs = nowNs
-		}
+		t.touchLocked(&t.authorities[i], nowNs)
 		return stats, true
 	}
 	for i := range t.regular {
@@ -120,12 +127,18 @@ func (t *LatencyTable) GetDomainStats(domain string) (DomainLatencyStats, bool) 
 			continue
 		}
 		stats := t.regular[i].stats
-		if nowNs-t.regular[i].lastAccessNs >= latencyReadTouchMinInterval.Nanoseconds() {
-			t.regular[i].lastAccessNs = nowNs
-		}
+		t.touchLocked(&t.regular[i], nowNs)
 		return stats, true
 	}
 	return DomainLatencyStats{}, false
+}
+
+// touchLocked refreshes a slot's last-access timestamp. Callers must hold at
+// least RLock on t.mu. The atomic keeps readers concurrent with each other.
+func (t *LatencyTable) touchLocked(slot *latencySlot, nowNs int64) {
+	if nowNs-slot.lastAccessNs.Load() >= latencyReadTouchMinInterval.Nanoseconds() {
+		slot.lastAccessNs.Store(nowNs)
+	}
 }
 
 // LoadEntry stores a bootstrap-recovered entry directly (no TD-EWMA).
@@ -159,8 +172,8 @@ func (t *LatencyTable) LoadEntryClassified(
 
 // Size returns the number of domains with latency data.
 func (t *LatencyTable) Size() int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	return t.totalSizeLocked()
 }
 
@@ -238,13 +251,13 @@ func (t *LatencyTable) upsertAuthorityLocked(
 	stats DomainLatencyStats,
 	accessNs int64,
 ) {
-	t.authorities = append(t.authorities, latencySlot{
-		key:          key,
-		domain:       domain,
-		stats:        stats,
-		lastAccessNs: accessNs,
-		occupied:     true,
-	})
+	t.authorities = append(t.authorities, latencySlot{})
+	target := &t.authorities[len(t.authorities)-1]
+	target.key = key
+	target.domain = domain
+	target.stats = stats
+	target.occupied = true
+	target.lastAccessNs.Store(accessNs)
 }
 
 func (t *LatencyTable) upsertRegularLocked(
@@ -257,16 +270,16 @@ func (t *LatencyTable) upsertRegularLocked(
 	oldestIdx := -1
 	oldestAccessNs := int64(0)
 	for i := range t.regular {
-		slot := t.regular[i]
-		if !slot.occupied {
+		if !t.regular[i].occupied {
 			if emptyIdx < 0 {
 				emptyIdx = i
 			}
 			continue
 		}
-		if oldestIdx < 0 || slot.lastAccessNs < oldestAccessNs {
+		slotAccessNs := t.regular[i].lastAccessNs.Load()
+		if oldestIdx < 0 || slotAccessNs < oldestAccessNs {
 			oldestIdx = i
-			oldestAccessNs = slot.lastAccessNs
+			oldestAccessNs = slotAccessNs
 		}
 	}
 
@@ -282,13 +295,18 @@ func (t *LatencyTable) upsertRegularLocked(
 		return "", false
 	}
 
-	t.regular[targetIdx] = latencySlot{
-		key:          key,
-		domain:       domain,
-		stats:        stats,
-		lastAccessNs: accessNs,
-		occupied:     true,
+	next := latencySlot{
+		key:      key,
+		domain:   domain,
+		stats:    stats,
+		occupied: true,
 	}
+	slot := &t.regular[targetIdx]
+	slot.key = next.key
+	slot.domain = next.domain
+	slot.stats = next.stats
+	slot.occupied = next.occupied
+	slot.lastAccessNs.Store(accessNs)
 	return evictedDomain, evicted
 }
 

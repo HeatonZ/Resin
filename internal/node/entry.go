@@ -39,9 +39,12 @@ type NodeEntry struct {
 	CreatedAt  time.Time
 
 	// --- Dynamic (guarded by mu) ---
-	mu              sync.RWMutex
-	subscriptionIDs []string
-	LastError       string
+	mu        sync.RWMutex
+	LastError string
+
+	// subscriptionIDs is published copy-on-write: mutations build a fresh slice
+	// and Store it, so readers do lock-free atomic loads without per-read copies.
+	subs atomic.Pointer[[]string]
 
 	// Atomic dynamic fields for concurrent hot-path reads.
 	FailureCount     atomic.Int32
@@ -70,6 +73,8 @@ func NewNodeEntry(hash Hash, rawOptions json.RawMessage, createdAt time.Time, ma
 		RawOptions: rawOptions,
 		CreatedAt:  createdAt,
 	}
+	emptySubs := []string{}
+	e.subs.Store(&emptySubs)
 	if maxLatencyTableEntries > 0 {
 		e.LatencyTable = NewLatencyTable(maxLatencyTableEntries)
 	}
@@ -78,46 +83,77 @@ func NewNodeEntry(hash Hash, rawOptions json.RawMessage, createdAt time.Time, ma
 
 // SubscriptionIDs returns a copy of the subscription ID slice (thread-safe).
 func (e *NodeEntry) SubscriptionIDs() []string {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	cp := make([]string, len(e.subscriptionIDs))
-	copy(cp, e.subscriptionIDs)
-	return cp
+	return e.subscriptionIDsSnapshot()
+}
+
+// subscriptionIDsSnapshot returns the current subscription ID slice.
+// The slice is treated as immutable once published (copy-on-write), so the
+// returned reference is safe to read and range over without locking.
+func (e *NodeEntry) subscriptionIDsSnapshot() []string {
+	current := e.subs.Load()
+	if current == nil {
+		return nil
+	}
+	return *current
 }
 
 // AddSubscriptionID adds subID to the subscription set if not already present.
 // Must be called under external synchronization (e.g. xsync.Compute).
 func (e *NodeEntry) AddSubscriptionID(subID string) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	for _, id := range e.subscriptionIDs {
-		if id == subID {
-			return // idempotent
+	current := e.subs.Load()
+	if current != nil {
+		for _, id := range *current {
+			if id == subID {
+				return // idempotent
+			}
 		}
 	}
-	e.subscriptionIDs = append(e.subscriptionIDs, subID)
+
+	capacity := 1
+	if current != nil {
+		capacity = len(*current) + 1
+	}
+	next := make([]string, 0, capacity)
+	if current != nil {
+		next = append(next, *current...)
+	}
+	next = append(next, subID)
+	e.subs.Store(&next)
 }
 
 // RemoveSubscriptionID removes subID from the subscription set.
 // Returns true if the set is now empty (node should be deleted).
 // Must be called under external synchronization (e.g. xsync.Compute).
 func (e *NodeEntry) RemoveSubscriptionID(subID string) (empty bool) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	for i, id := range e.subscriptionIDs {
+	current := e.subs.Load()
+	if current == nil {
+		return true
+	}
+	idx := -1
+	for i, id := range *current {
 		if id == subID {
-			e.subscriptionIDs = append(e.subscriptionIDs[:i], e.subscriptionIDs[i+1:]...)
+			idx = i
 			break
 		}
 	}
-	return len(e.subscriptionIDs) == 0
+	if idx < 0 {
+		return len(*current) == 0
+	}
+
+	next := make([]string, 0, len(*current)-1)
+	next = append(next, (*current)[:idx]...)
+	next = append(next, (*current)[idx+1:]...)
+	e.subs.Store(&next)
+	return len(next) == 0
 }
 
 // SubscriptionCount returns the number of subscriptions referencing this node.
 func (e *NodeEntry) SubscriptionCount() int {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return len(e.subscriptionIDs)
+	current := e.subs.Load()
+	if current == nil {
+		return 0
+	}
+	return len(*current)
 }
 
 // MatchRegexs tests whether the node matches ALL given regex filters.
@@ -138,10 +174,7 @@ func (e *NodeEntry) MatchTagFilter(filter TagFilter, subLookup SubLookupFunc) bo
 		return filter.Empty()
 	}
 
-	e.mu.RLock()
-	subs := make([]string, len(e.subscriptionIDs))
-	copy(subs, e.subscriptionIDs)
-	e.mu.RUnlock()
+	subs := e.subscriptionIDsSnapshot()
 
 	if len(subs) == 0 {
 		return false
@@ -186,10 +219,7 @@ func (e *NodeEntry) HasEnabledSubscription(subLookup SubLookupFunc) bool {
 		return false
 	}
 
-	e.mu.RLock()
-	subs := make([]string, len(e.subscriptionIDs))
-	copy(subs, e.subscriptionIDs)
-	e.mu.RUnlock()
+	subs := e.subscriptionIDsSnapshot()
 
 	for _, subID := range subs {
 		_, enabled, _, ok := subLookup(subID, e.Hash)

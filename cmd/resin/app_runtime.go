@@ -340,6 +340,12 @@ func (a *resinApp) startBackgroundServices() {
 	log.Println("Metrics manager started (batch 1)")
 
 	// --- Step 8 Batch 2: ProbeManager, RequestLog, LeaseCleaner, EphemeralCleaner ---
+	// The dirty drainer must start before the probe manager: probe workers and
+	// passive request-path health feedback enqueue platform re-evaluations,
+	// and without a running drainer those helpers fall back to inline applies.
+	a.topoRuntime.pool.StartPlatformDirtyWorker()
+	log.Println("Platform dirty worker started (batch 2)")
+
 	a.topoRuntime.probeMgr.SetOnProbeEvent(func(kind string) {
 		a.metricsManager.OnProbeEvent(metrics.ProbeEvent{Kind: metrics.ProbeKind(kind)})
 	})
@@ -569,6 +575,11 @@ func (a *resinApp) shutdown(ctx context.Context) {
 
 	a.topoRuntime.probeMgr.Stop()
 	log.Println("Probe manager stopped")
+
+	// Stop the dirty drainer after its producers: it flushes whatever is still
+	// queued so no platform re-evaluation is lost on shutdown.
+	a.topoRuntime.pool.ClosePlatformDirtyWorker()
+	log.Println("Platform dirty worker stopped")
 
 	a.geoSvc.Stop()
 	log.Println("GeoIP service stopped")

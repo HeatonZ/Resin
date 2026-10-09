@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Resinat/Resin/internal/netutil"
@@ -50,7 +51,36 @@ type GlobalNodePool struct {
 	maxConsecutiveFailures func() int
 	latencyDecayWindow     func() time.Duration
 	latencyAuthorities     func() []string
+
+	// dirtyQueue coalesces platform re-evaluations. Producers enqueue node
+	// hashes without blocking; the drainer applies each hash at most once.
+	// When the buffer is full the producer applies inline, so a notification
+	// is never dropped — only deferred under sustained backpressure.
+	dirtyQueue   chan node.Hash
+	dirtyPending map[node.Hash]bool
+	dirtyMu      sync.Mutex
+	// dirtyQueueFiltered carries hashes that only latency-filtered platforms
+	// need to re-evaluate (authority latency samples), so the drainer skips
+	// platforms with MaxReferenceLatencyMs == 0.
+	dirtyQueueFiltered chan node.Hash
+	dirtyStop          chan struct{}
+	dirtyStopOnce      sync.Once
+	dirtyWG            sync.WaitGroup
+	// dirtyApplied is incremented after a notification is fully applied. The
+	// flush helper uses it to distinguish "drained" from "never started".
+	dirtyApplied atomic.Int64
+	// dirtyBusy is 1 while the drainer is inside an apply, 0 when parked in
+	// select. FlushPlatformDirty uses it to prove nothing is in flight.
+	dirtyBusy atomic.Int32
+	// dirtyRunning is set by StartPlatformDirtyWorker. While false, the async
+	// helpers apply inline so no notification is dropped.
+	dirtyRunning atomic.Bool
 }
+
+// PlatformDirtyQueueSize is the coalescing queue capacity for node-hash dirty
+// notifications. Overflow is safe: a full queue falls back to mark-and-flush,
+// so notifications are delayed but still applied.
+const PlatformDirtyQueueSize = 4096
 
 // PoolConfig configures the GlobalNodePool.
 type PoolConfig struct {
@@ -81,7 +111,7 @@ func NewGlobalNodePool(cfg PoolConfig) *GlobalNodePool {
 		panic("topology: NewGlobalNodePool requires non-nil MaxConsecutiveFailures")
 	}
 
-	return &GlobalNodePool{
+	pool := &GlobalNodePool{
 		nodes:                  xsync.NewMap[node.Hash, *node.NodeEntry](),
 		subLookup:              cfg.SubLookup,
 		geoLookup:              cfg.GeoLookup,
@@ -96,7 +126,12 @@ func NewGlobalNodePool(cfg PoolConfig) *GlobalNodePool {
 		latencyAuthorities:     cfg.LatencyAuthorities,
 		platformByID:           make(map[string]*platform.Platform),
 		platformByName:         make(map[string]*platform.Platform),
+		dirtyQueue:             make(chan node.Hash, PlatformDirtyQueueSize),
+		dirtyQueueFiltered:     make(chan node.Hash, PlatformDirtyQueueSize),
+		dirtyPending:           make(map[node.Hash]bool),
+		dirtyStop:              make(chan struct{}),
 	}
+	return pool
 }
 
 // AddNodeFromSub adds a node to the pool with the given subscription reference.
@@ -415,7 +450,212 @@ func (p *GlobalNodePool) MakeHealthyAndEnabledEvaluator() func(entry *node.NodeE
 }
 
 // notifyAllPlatformsDirty tells every registered platform to re-evaluate a node.
+//
+// This is the synchronous variant: it applies the re-evaluation before
+// returning, and it "consumes" a queued notification for the same hash so the
+// drainer does not apply the same node twice. Production hot paths use
+// markNodeDirtyAsync instead; tests and control-plane operations that assert
+// view contents immediately after a mutation use this one.
 func (p *GlobalNodePool) notifyAllPlatformsDirty(hash node.Hash) {
+	if len(p.platformSnapshot()) == 0 {
+		return
+	}
+
+	p.dirtyMu.Lock()
+	if p.dirtyPending[hash] {
+		p.dirtyPending[hash] = false // suppress coalescing for this hash
+		p.dirtyMu.Unlock()
+		p.applyPlatformDirty(hash)
+		return
+	}
+	p.dirtyPending[hash] = false
+	p.dirtyMu.Unlock()
+
+	p.applyPlatformDirty(hash)
+}
+
+// markNodeDirtyAsync is the non-blocking variant used on hot paths (probe
+// workers, passive health feedback). It enqueues the hash for the drainer and
+// returns immediately. If the buffer is full it falls back to an inline apply,
+// so a notification is never dropped.
+func (p *GlobalNodePool) markNodeDirtyAsync(hash node.Hash) {
+	if !p.dirtyRunning.Load() {
+		// No drainer yet (tests, or pre-start): apply inline so the
+		// notification is never silently dropped.
+		p.applyPlatformDirty(hash)
+		return
+	}
+
+	p.dirtyMu.Lock()
+	if pending, ok := p.dirtyPending[hash]; ok && pending {
+		p.dirtyMu.Unlock()
+		return // already queued; one apply covers both
+	}
+	p.dirtyPending[hash] = true
+	p.dirtyMu.Unlock()
+
+	select {
+	case p.dirtyQueue <- hash:
+		return
+	default:
+	}
+
+	// Backpressure: apply inline so nothing is lost.
+	p.dirtyMu.Lock()
+	delete(p.dirtyPending, hash)
+	p.dirtyMu.Unlock()
+	p.applyPlatformDirty(hash)
+}
+
+// markNodeFilteredDirtyAsync is the latency-filtered counterpart of
+// markNodeDirtyAsync: it queues the hash for the drainer and returns
+// immediately. The drainer applies it only to platforms whose routable view
+// depends on reference latency (MaxReferenceLatencyMs > 0), preserving the
+// v1.2.3 optimisation that avoids re-evaluating latency-agnostic platforms on
+// every authority latency sample.
+func (p *GlobalNodePool) markNodeFilteredDirtyAsync(hash node.Hash) {
+	if !p.dirtyRunning.Load() {
+		p.applyFilteredDirty(hash)
+		return
+	}
+	select {
+	case p.dirtyQueueFiltered <- hash:
+	case <-p.dirtyStop:
+	}
+}
+
+// StartPlatformDirtyWorker launches the drainer. Must be called once, before
+// health/latency feedback flows, and paired with ClosePlatformDirtyWorker.
+func (p *GlobalNodePool) StartPlatformDirtyWorker() {
+	p.dirtyRunning.Store(true)
+	p.dirtyWG.Add(1)
+	go func() {
+		defer p.dirtyWG.Done()
+		p.drainPlatformDirty()
+	}()
+}
+
+// ClosePlatformDirtyWorker stops the drainer and flushes anything still queued.
+func (p *GlobalNodePool) ClosePlatformDirtyWorker() {
+	p.dirtyStopOnce.Do(func() { close(p.dirtyStop) })
+	p.dirtyWG.Wait()
+}
+
+// FlushPlatformDirty applies every pending dirty notification and returns once
+// the platform views reflect them.
+//
+// This exists for callers that must observe view contents deterministically
+// right after a mutation (tests, control-plane paths that immediately read a
+// platform's routable set). Production request/probe paths never call it —
+// they accept the drainer's eventual consistency.
+func (p *GlobalNodePool) FlushPlatformDirty() {
+	if !p.dirtyRunning.Load() {
+		return // no drainer: helpers applied inline, nothing to wait for
+	}
+	deadline := time.Now().Add(flushWaitTimeout)
+	emptyStreak := 0
+	for time.Now().Before(deadline) {
+		p.dirtyMu.Lock()
+		pending := len(p.dirtyPending)
+		p.dirtyMu.Unlock()
+		queued := p.dirtyQueued()
+		inFlight := p.dirtyBusy.Load() != 0
+
+		if pending == 0 && queued == 0 && !inFlight {
+			emptyStreak++
+			// Two consecutive calm samples (a drainer that just picked work up
+			// will show busy on at least one of them) means nothing is left.
+			if emptyStreak >= 2 {
+				return
+			}
+		} else {
+			emptyStreak = 0
+		}
+		time.Sleep(flushPollInterval)
+	}
+}
+
+// dirtyQueued reports how many notifications are still waiting to be applied
+// (in flight or buffered). It is read without holding dirtyMu so the flush
+// loop never blocks the drainer it is waiting for.
+func (p *GlobalNodePool) dirtyQueued() int {
+	return len(p.dirtyQueue) + len(p.dirtyQueueFiltered)
+}
+
+const (
+	flushWaitTimeout  = 2 * time.Second
+	flushPollInterval = time.Millisecond
+)
+
+func (p *GlobalNodePool) drainPlatformDirty() {
+	for {
+		// Parked in select: nothing in flight.
+		p.dirtyBusy.Store(0)
+		select {
+		case hash := <-p.dirtyQueue:
+			p.dirtyBusy.Store(1)
+			p.applyDirty(hash)
+		case hash := <-p.dirtyQueueFiltered:
+			p.dirtyBusy.Store(1)
+			p.applyFilteredDirty(hash)
+		case <-p.dirtyStop:
+			// Flush what is still queued so shutdown loses no re-evaluation.
+		drainLoop:
+			for {
+				select {
+				case hash := <-p.dirtyQueue:
+					p.dirtyBusy.Store(1)
+					p.applyDirty(hash)
+				case hash := <-p.dirtyQueueFiltered:
+					p.dirtyBusy.Store(1)
+					p.applyFilteredDirty(hash)
+				default:
+					break drainLoop
+				}
+			}
+			p.dirtyBusy.Store(0)
+			return
+		}
+	}
+}
+
+// applyDirty clears the coalescing mark for hash and runs the re-evaluation
+// across all platforms.
+func (p *GlobalNodePool) applyDirty(hash node.Hash) {
+	p.dirtyMu.Lock()
+	delete(p.dirtyPending, hash)
+	p.dirtyMu.Unlock()
+	p.applyPlatformDirty(hash)
+	p.dirtyApplied.Add(1)
+}
+
+// applyFilteredDirty re-evaluates hash on latency-filtered platforms only.
+func (p *GlobalNodePool) applyFilteredDirty(hash node.Hash) {
+	platforms := p.platformSnapshot()
+	filtered := make([]*platform.Platform, 0, len(platforms))
+	for _, plat := range platforms {
+		if plat.MaxReferenceLatencyMs > 0 {
+			filtered = append(filtered, plat)
+		}
+	}
+	if len(filtered) == 0 {
+		return
+	}
+
+	subLookup := p.MakeSubLookup()
+	getEntry := func(h node.Hash) (*node.NodeEntry, bool) {
+		return p.nodes.Load(h)
+	}
+	for _, plat := range filtered {
+		plat.NotifyDirty(hash, getEntry, subLookup, p.geoLookup, p.latencyAuthorities)
+	}
+	p.dirtyApplied.Add(1)
+}
+
+// applyPlatformDirty runs the actual per-platform re-evaluation for one node.
+// This is the body the previous implementation executed synchronously in every
+// caller; it is unchanged apart from being reached via the queue.
+func (p *GlobalNodePool) applyPlatformDirty(hash node.Hash) {
 	platforms := p.platformSnapshot()
 	if len(platforms) == 0 {
 		return
@@ -551,8 +791,12 @@ func (p *GlobalNodePool) RecordResult(hash node.Hash, success bool) {
 		}
 	}
 
+	// Hot path: probe workers and passive request-path feedback must not block
+	// on platform view locks. Coalesced + drained in the background.
+	// The dirty mark is only needed when circuit state actually changed —
+	// otherwise every successful probe result re-enqueues the node.
 	if circuitStateChanged {
-		p.notifyAllPlatformsDirty(hash)
+		p.markNodeDirtyAsync(hash)
 	}
 	if dynamicChanged && p.onNodeDynamicChanged != nil {
 		p.onNodeDynamicChanged(hash)
@@ -623,10 +867,13 @@ func (p *GlobalNodePool) RecordLatency(hash node.Hash, rawTarget string, latency
 
 	// A latency-filtered platform must be re-evaluated when an authority sample
 	// changes. Platforms without a reference-latency limit do not depend on it.
+	// Both branches are hot paths (every probe writes latency), so they enqueue
+	// rather than blocking on platform view locks — but the "filtered only"
+	// optimisation from v1.2.3 is preserved.
 	if wasEmpty {
-		p.notifyAllPlatformsDirty(hash)
+		p.markNodeDirtyAsync(hash)
 	} else if isAuthority {
-		p.notifyLatencyFilteredPlatformsDirty(hash)
+		p.markNodeFilteredDirtyAsync(hash)
 	}
 
 	if p.onNodeLatencyChanged != nil {
@@ -706,7 +953,9 @@ func (p *GlobalNodePool) UpdateNodeEgressIP(hash node.Hash, ip *netip.Addr, loc 
 	}
 
 	if ipChanged || regionChanged {
-		p.notifyAllPlatformsDirty(hash)
+		// Hot path: an egress probe changing region/IP can arrive for hundreds
+		// of nodes in one scan. Enqueue instead of blocking on view locks.
+		p.markNodeDirtyAsync(hash)
 	}
 	if p.onNodeDynamicChanged != nil {
 		p.onNodeDynamicChanged(hash)

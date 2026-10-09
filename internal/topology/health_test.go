@@ -210,12 +210,14 @@ func TestRecordResult_CircuitBreak_RemovesFromView(t *testing.T) {
 	// Circuit break → remove from view.
 	pool.RecordResult(h, false)
 	pool.RecordResult(h, false)
+	pool.FlushPlatformDirty()
 	if plat.View().Size() != 0 {
 		t.Fatal("circuit-broken node should be removed from view")
 	}
 
 	// Recover → back in view.
 	pool.RecordResult(h, true)
+	pool.FlushPlatformDirty()
 	if plat.View().Size() != 1 {
 		t.Fatal("recovered node should be back in view")
 	}
@@ -490,6 +492,7 @@ func TestUpdateNodeEgressIP_LocStateMachine(t *testing.T) {
 	if got := entry.GetEgressRegion(); got != "jp" {
 		t.Fatalf("egress region: got %q, want %q", got, "jp")
 	}
+	pool.FlushPlatformDirty()
 	if plat.View().Size() != 1 {
 		t.Fatal("node should be routable with explicit jp region")
 	}
@@ -499,6 +502,7 @@ func TestUpdateNodeEgressIP_LocStateMachine(t *testing.T) {
 	if got := entry.GetEgressRegion(); got != "us" {
 		t.Fatalf("egress region: got %q, want %q", got, "us")
 	}
+	pool.FlushPlatformDirty()
 	if plat.View().Size() != 0 {
 		t.Fatal("same IP but changed region should trigger platform re-evaluation")
 	}
