@@ -48,7 +48,11 @@ type NodeEntry struct {
 
 	// Atomic dynamic fields for concurrent hot-path reads.
 	FailureCount     atomic.Int32
-	CircuitOpenSince atomic.Int64               // unix-nano; 0 = not open
+	CircuitOpenSince atomic.Int64 // unix-nano; 0 = not open
+	// Lease-deletion penalty. Unlike FailureCount, this is NOT cleared by probe
+	// success: it decays over time (see EffectivePenaltyNs).
+	PenaltyUnits     atomic.Int32               // accumulated penalty units; 0 = none
+	PenaltyUpdated   atomic.Int64               // unix-nano of last penalty event; 0 = never
 	egressIP         atomic.Pointer[netip.Addr] // nil before first store
 	egressRegion     atomic.Pointer[string]     // lowercase country code from probe trace; nil when unknown
 	LastEgressUpdate atomic.Int64               // unix-nano of last successful egress-IP sample

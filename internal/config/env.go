@@ -80,6 +80,10 @@ func DefaultNodeDNSUpstreams() []string {
 	}
 }
 
+// LeasePenaltyEnabled reports whether deleting a lease records a node penalty.
+// RESIN_LEASE_PENALTY=0 disables it; unset or any other value enables it.
+func LeasePenaltyEnabled() bool { return os.Getenv("RESIN_LEASE_PENALTY") != "0" }
+
 // LoadEnvConfig reads environment variables and returns a validated EnvConfig.
 // Returns an error if any required variable is missing or any value is invalid.
 func LoadEnvConfig() (*EnvConfig, error) {

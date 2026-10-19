@@ -226,22 +226,34 @@ func calculateScore(
 	}
 
 	// If latency is 0 (empty/incompatible), score = LeaseCount strictly.
+	var base float64
 	if latency <= 0 {
-		return float64(leaseCount)
+		base = float64(leaseCount)
+	} else {
+		// Policy-based scoring.
+		switch plat.AllocationPolicy {
+		case platform.AllocationPolicyPreferLowLatency:
+			base = float64(latency)
+		case platform.AllocationPolicyPreferLowLatencyAndIdle:
+			base = float64(latency)
+		case platform.AllocationPolicyPreferIdleIP:
+			base = float64(leaseCount)
+		case platform.AllocationPolicyBalanced:
+			fallthrough
+		default:
+			// (LeaseCount + 1) * Latency
+			base = float64(leaseCount+1) * float64(latency)
+		}
 	}
 
-	// Policy-based scoring.
-	switch plat.AllocationPolicy {
-	case platform.AllocationPolicyPreferLowLatency:
-		return float64(latency)
-	case platform.AllocationPolicyPreferLowLatencyAndIdle:
-		return float64(latency)
-	case platform.AllocationPolicyPreferIdleIP:
-		return float64(leaseCount)
-	case platform.AllocationPolicyBalanced:
-		fallthrough
-	default:
-		// (LeaseCount + 1) * Latency
-		return float64(leaseCount+1) * float64(latency)
+	// Lease-deletion penalty: graded, time-decayed, applied in the same
+	// (nanosecond-latency) dimension as the policy score. Lower is better, so
+	// a penalised node loses P2C comparisons but is not hard-excluded.
+	// Under AllocationPolicyBalanced the base is latency*leaseCount, so the
+	// additive penalty is only a coarse de-weighting there.
+	var penalty float64
+	if entry != nil {
+		penalty = node.EffectivePenaltyNs(entry.PenaltyUnits.Load(), entry.PenaltyUpdated.Load(), time.Now())
 	}
+	return base + penalty
 }

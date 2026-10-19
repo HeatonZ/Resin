@@ -4,6 +4,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Resinat/Resin/internal/config"
 	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/routing"
@@ -133,8 +134,14 @@ func (s *ControlPlaneService) DeleteLease(platformID, account string) error {
 	if _, ok := s.Pool.GetPlatform(platformID); !ok {
 		return notFound("platform not found")
 	}
+	// Capture the bound node before the lease disappears, so the deletion can
+	// be recorded as a penalty against that single node.
+	lease, hadLease := s.Router.GetLease(platformID, account)
 	if !s.Router.DeleteLease(platformID, account) {
 		return notFound("lease not found")
+	}
+	if hadLease && config.LeasePenaltyEnabled() {
+		s.Pool.ApplyNodePenalty(lease.NodeHash, node.LeaseDeletePenaltyUnits)
 	}
 	return nil
 }

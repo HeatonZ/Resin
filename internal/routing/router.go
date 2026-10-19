@@ -617,6 +617,15 @@ func (r *Router) RangeLeases(platformID string, fn func(account string, lease Le
 	return true
 }
 
+// GetLease returns the lease bound to the given account, if any.
+func (r *Router) GetLease(platformID, account string) (Lease, bool) {
+	state, ok := r.states.Load(platformID)
+	if !ok {
+		return Lease{}, false
+	}
+	return state.Leases.GetLease(account)
+}
+
 // DeleteLease removes a single lease by platform and account.
 // Returns true if a lease was deleted. Emits a LeaseRemove event.
 func (r *Router) DeleteLease(platformID, account string) bool {

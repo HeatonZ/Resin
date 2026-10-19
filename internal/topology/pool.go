@@ -803,6 +803,27 @@ func (p *GlobalNodePool) RecordResult(hash node.Hash, success bool) {
 	}
 }
 
+// ApplyNodePenalty records a lease-deletion penalty on a single node.
+// Unlike RecordResult, the penalty is not cleared by a successful probe; it
+// decays over time via node.EffectivePenaltyNs. Only the node identified by
+// hash is affected.
+func (p *GlobalNodePool) ApplyNodePenalty(hash node.Hash, units int32) {
+	if units <= 0 {
+		return
+	}
+	entry, ok := p.GetEntry(hash)
+	if !ok {
+		return
+	}
+	entry.PenaltyUnits.Add(units)
+	entry.PenaltyUpdated.Store(time.Now().UnixNano())
+	// Persist: without this the penalty would only live in memory and be lost
+	// on restart. Mirrors RecordResult's dynamic-change notification.
+	if p.onNodeDynamicChanged != nil {
+		p.onNodeDynamicChanged(hash)
+	}
+}
+
 // RecordPassiveResult records health feedback from user proxy traffic.
 // Failed passive traffic is ignored when the originating platform disables
 // passive circuit breaking; successes still count as positive health feedback.
