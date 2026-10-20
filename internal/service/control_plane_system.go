@@ -89,6 +89,7 @@ var runtimeConfigAllowedFields = map[string]bool{
 	"latency_test_url":                         true,
 	"latency_authorities":                      true,
 	"probe_reject_status_codes":                true,
+	"probe_reject_only_unreachable":            true,
 	"probe_request":                            true,
 	"probe_reject_body_substrings":             true,
 	"probe_script_build":                       true,

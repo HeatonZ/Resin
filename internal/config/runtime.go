@@ -45,6 +45,15 @@ type RuntimeConfig struct {
 	// this, every gated node looks healthy. Empty disables status-based
 	// rejection and restores the legacy "any response is healthy" behaviour.
 	ProbeRejectStatusCodes []int `json:"probe_reject_status_codes"`
+	// ProbeRejectOnlyUnreachable limits probe failure to connectivity problems.
+	//
+	// A 403 does not prove the egress is unusable: the free tier also answers
+	// 403 when the request lacks a real client identity, so a healthy node and a
+	// blocked one are indistinguishable without credentials. When true, only
+	// transport-level failures (dial timeout, connection reset, TLS error) fail
+	// the probe; a completed HTTP exchange counts as reachable regardless of the
+	// status code. Use this when the probe cannot carry credentials.
+	ProbeRejectOnlyUnreachable bool `json:"probe_reject_only_unreachable"`
 	// ProbeRequest is an optional HTTP probe template. A bare GET of a website
 	// root answers 200 for every node, so a gated node looks identical to a
 	// healthy one; replaying the real business request (method, body, client

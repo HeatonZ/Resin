@@ -347,6 +347,7 @@ func newTopologyRuntime(
 			reject := rejectStatusSnapshot(cfgSnap.ProbeRejectStatusCodes)
 			markers := rejectBodySnapshot(cfgSnap.ProbeRejectBodySubstrings)
 			tpl := cfgSnap.ProbeRequest
+			onlyUnreachable := cfgSnap.ProbeRejectOnlyUnreachable
 
 			// Probe script: operator-supplied JS that builds the request and can
 			// judge the response. Compiled once per config version; a broken
@@ -381,6 +382,14 @@ func newTopologyRuntime(
 					}
 				},
 			}
+			// Connectivity-only mode: the probe has no credentials, so a 403
+			// cannot distinguish a blocked egress from a request the gate refuses
+			// to serve without client identity. Judge reachability instead of
+			// status, and drop the status/body rules that would reject every node.
+			if onlyUnreachable {
+				opts.AcceptStatus = nil
+				opts.AcceptBody = nil
+			}
 			// Script-built request wins over the declarative template: the
 			// script exists precisely to express what a template cannot.
 			scriptBuilt := false
@@ -408,7 +417,7 @@ func newTopologyRuntime(
 
 			// A judge script overrides the built-in status/body rules: only it
 			// knows what a healthy payload looks like for this upstream.
-			judging := scriptEngine != nil && scriptEngine.ShouldJudge()
+			judging := scriptEngine != nil && scriptEngine.ShouldJudge() && !onlyUnreachable
 			statusCode := 0
 			if judging {
 				opts.AcceptStatus = nil // judged below, with full context
