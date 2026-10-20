@@ -2,6 +2,23 @@ package config
 
 import "time"
 
+// ProbeRequestTemplate describes a replayed HTTP probe request. The zero value
+// means "plain GET with no body", preserving legacy behaviour.
+type ProbeRequestTemplate struct {
+	// Method is the HTTP method; empty means GET.
+	Method string `json:"method"`
+	// Body is the request body sent verbatim; empty means no body.
+	Body string `json:"body"`
+	// Headers are extra request headers (Content-Type, auth, client identity).
+	Headers map[string]string `json:"headers"`
+}
+
+// IsZero reports whether the template is unset, so callers can fall back to the
+// legacy plain-GET probe without special-casing each field.
+func (t ProbeRequestTemplate) IsZero() bool {
+	return t.Method == "" && t.Body == "" && len(t.Headers) == 0
+}
+
 // RuntimeConfig holds all hot-updatable global settings.
 // These are persisted in the database and served via GET /system/config.
 type RuntimeConfig struct {
@@ -22,6 +39,34 @@ type RuntimeConfig struct {
 	// Probe
 	LatencyTestURL     string   `json:"latency_test_url"`
 	LatencyAuthorities []string `json:"latency_authorities"`
+	// ProbeRejectStatusCodes lists HTTP status codes that must be treated as a
+	// failed probe even though the request completed. A node behind an upstream
+	// gate answers 403/429/5xx over a perfectly working TCP/TLS path; without
+	// this, every gated node looks healthy. Empty disables status-based
+	// rejection and restores the legacy "any response is healthy" behaviour.
+	ProbeRejectStatusCodes []int `json:"probe_reject_status_codes"`
+	// ProbeRequest is an optional HTTP probe template. A bare GET of a website
+	// root answers 200 for every node, so a gated node looks identical to a
+	// healthy one; replaying the real business request (method, body, client
+	// headers) is what actually reproduces what traffic does. Empty means the
+	// legacy plain GET.
+	ProbeRequest ProbeRequestTemplate `json:"probe_request"`
+	// ProbeRejectBodySubstrings rejects a probe whose body contains any of
+	// these substrings (case-insensitive). Gates that answer 200 with an error
+	// document need this; a healthy 200 body never contains them.
+	ProbeRejectBodySubstrings []string `json:"probe_reject_body_substrings"`
+	// ProbeScriptBuild is a JavaScript snippet returning {url, method, headers,
+	// body}. It replaces the declarative probe_request template, which cannot
+	// express logic (fetch a token first, branch on node attributes, ...).
+	// Empty = use probe_request or the legacy plain GET.
+	ProbeScriptBuild string `json:"probe_script_build"`
+	// ProbeScriptJudge is a JavaScript snippet receiving (ctx, statusCode, body)
+	// and returning {ok, reason}. It overrides the status/body-marker rules so
+	// arbitrary upstreams can be judged. Empty = built-in rules only.
+	ProbeScriptJudge string `json:"probe_script_judge"`
+	// ProbeScriptEnabled gates both scripts. Off by default: an operator script
+	// runs across the whole pool, so it must be an explicit opt-in.
+	ProbeScriptEnabled bool `json:"probe_script_enabled"`
 
 	// P2C
 	P2CLatencyWindow   Duration `json:"p2c_latency_window"`
@@ -30,6 +75,25 @@ type RuntimeConfig struct {
 	// Persistence
 	CacheFlushInterval       Duration `json:"cache_flush_interval"`
 	CacheFlushDirtyThreshold int      `json:"cache_flush_dirty_threshold"`
+}
+
+// ApplyMissingDefaults fills defaults into fields that were absent from
+// persisted JSON. Older config rows predate fields added later (for example
+// probe_reject_status_codes), and unmarshalling leaves those as nil. Without
+// this, an upgrade silently disables the new rules instead of adopting their
+// defaults.
+//
+// Only nil slices are filled. An explicitly stored empty slice is a deliberate
+// operator choice ("disable this rule"), and JSON distinguishes the two, so it
+// must be preserved.
+func (c *RuntimeConfig) ApplyMissingDefaults() {
+	def := NewDefaultRuntimeConfig()
+	if c.ProbeRejectStatusCodes == nil {
+		c.ProbeRejectStatusCodes = def.ProbeRejectStatusCodes
+	}
+	if c.LatencyAuthorities == nil {
+		c.LatencyAuthorities = def.LatencyAuthorities
+	}
 }
 
 // NewDefaultRuntimeConfig returns a RuntimeConfig populated with the default
@@ -50,6 +114,10 @@ func NewDefaultRuntimeConfig() *RuntimeConfig {
 
 		LatencyTestURL:     "https://www.gstatic.com/generate_204",
 		LatencyAuthorities: []string{"gstatic.com", "google.com", "cloudflare.com", "github.com"},
+		// A 403/429/5xx answer means the upstream gate rejected this egress;
+		// counting it as a healthy probe is what let fully-gated nodes stay in
+		// rotation. Defaults are the codes observed from the free-tier gate.
+		ProbeRejectStatusCodes: []int{403, 429, 500, 502, 503, 504},
 
 		P2CLatencyWindow:   Duration(10 * time.Minute),
 		LatencyDecayWindow: Duration(10 * time.Minute),

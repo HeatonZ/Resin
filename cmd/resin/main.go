@@ -23,6 +23,7 @@ import (
 	"github.com/Resinat/Resin/internal/outbound"
 	"github.com/Resinat/Resin/internal/platform"
 	"github.com/Resinat/Resin/internal/probe"
+	"github.com/Resinat/Resin/internal/probescript"
 	"github.com/Resinat/Resin/internal/proxy"
 	"github.com/Resinat/Resin/internal/requestlog"
 	"github.com/Resinat/Resin/internal/routing"
@@ -86,6 +87,9 @@ func loadRuntimeConfig(engine *state.StateEngine) *config.RuntimeConfig {
 		return config.NewDefaultRuntimeConfig()
 	}
 	log.Printf("Loaded persisted runtime config (version %d)", ver)
+	// Older rows predate fields added later; adopt their defaults rather than
+	// starting with nil and silently disabling the new probe rules.
+	runtimeCfg.ApplyMissingDefaults()
 	return runtimeCfg
 }
 
@@ -115,6 +119,74 @@ func runtimeConfigSnapshot(runtimeCfg *atomic.Pointer[config.RuntimeConfig]) *co
 		return config.NewDefaultRuntimeConfig()
 	}
 	return cfg
+}
+
+// rejectStatusSnapshot copies the probe status-rejection list so the probe
+// closure never reads shared config concurrently with a hot reload.
+func rejectStatusSnapshot(codes []int) []int {
+	if len(codes) == 0 {
+		return nil
+	}
+	out := make([]int, len(codes))
+	copy(out, codes)
+	return out
+}
+
+// rejectBodySnapshot copies the body-marker list for the same reason.
+func rejectBodySnapshot(markers []string) []string {
+	if len(markers) == 0 {
+		return nil
+	}
+	out := make([]string, len(markers))
+	copy(out, markers)
+	return out
+}
+
+// bodyContainsAny reports whether body contains any marker, case-insensitively.
+// Gates do not guarantee casing, and a false negative here means a gated node
+// keeps being treated as healthy.
+func bodyContainsAny(body []byte, markers []string) bool {
+	if len(body) == 0 {
+		return false
+	}
+	lower := strings.ToLower(string(body))
+	for _, m := range markers {
+		if m == "" {
+			continue
+		}
+		if strings.Contains(lower, strings.ToLower(m)) {
+			return true
+		}
+	}
+	return false
+}
+
+// probeScriptEngine caches the compiled script engine per source pair. A probe
+// cycle touches every node in the pool, so recompiling per node would be pure
+// waste; recompiling per config version is enough.
+var probeScriptCache struct {
+	mu     sync.Mutex
+	build  string
+	judge  string
+	engine *probescript.Engine
+}
+
+func probeScriptEngine(buildSrc, judgeSrc string) *probescript.Engine {
+	probeScriptCache.mu.Lock()
+	defer probeScriptCache.mu.Unlock()
+	if probeScriptCache.engine != nil &&
+		probeScriptCache.build == buildSrc &&
+		probeScriptCache.judge == judgeSrc {
+		return probeScriptCache.engine
+	}
+	engine := probescript.New(buildSrc, judgeSrc)
+	if err := engine.Err(); err != nil {
+		log.Printf("[probe] probe script compile failed, built-in behaviour retained: %v", err)
+	}
+	probeScriptCache.build = buildSrc
+	probeScriptCache.judge = judgeSrc
+	probeScriptCache.engine = engine
+	return engine
 }
 
 type requestLogRuntimeSettings struct {
@@ -247,7 +319,12 @@ func newTopologyRuntime(
 	}
 	outboundMgr := outbound.NewOutboundManager(pool, singboxBuilder)
 
-	probeMgr := probe.NewProbeManager(probe.ProbeConfig{
+	// Bound after construction: the fetcher needs to know which URL belongs to
+	// the latency probe, but the manager is what owns that URL. Assigning later
+	// avoids a chicken-and-egg in the wiring without a package-level global.
+	var probeMgr *probe.ProbeManager
+
+	probeMgr = probe.NewProbeManager(probe.ProbeConfig{
 		Pool:        pool,
 		Concurrency: envCfg.ProbeConcurrency,
 		Fetcher: func(hash node.Hash, url string) ([]byte, time.Duration, error) {
@@ -261,14 +338,98 @@ func newTopologyRuntime(
 			if outboundPtr == nil {
 				return nil, 0, outbound.ErrOutboundNotReady
 			}
-			return netutil.HTTPGetViaOutbound(ctx, *outboundPtr, url, netutil.OutboundHTTPOptions{
-				RequireStatusOK: false,
+			// A gated egress still completes the TCP/TLS handshake and still
+			// answers — with 403/429/5xx, or even 200 plus an error document.
+			// Treating any response as healthy is what kept fully-gated nodes
+			// in rotation while every real request through them failed, so
+			// reject both the status codes and the body markers of a gate.
+			cfgSnap := runtimeConfigSnapshot(runtimeCfg)
+			reject := rejectStatusSnapshot(cfgSnap.ProbeRejectStatusCodes)
+			markers := rejectBodySnapshot(cfgSnap.ProbeRejectBodySubstrings)
+			tpl := cfgSnap.ProbeRequest
+
+			// Probe script: operator-supplied JS that builds the request and can
+			// judge the response. Compiled once per config version; a broken
+			// script falls back to the declarative template rather than taking
+			// health checking offline.
+			scriptCtx := probescript.Context{
+				NodeHash: hash.Hex(),
+				BaseURL:  url,
+				NowUnix:  time.Now().Unix(),
+			}
+			var scriptEngine *probescript.Engine
+			// Only the latency probe replays the business request. The egress
+			// probe must stay a plain GET of the Cloudflare trace endpoint: it
+			// exists to learn the node's egress IP from that body, and rewriting
+			// the request would silently stop egress-IP discovery.
+			if cfgSnap.ProbeScriptEnabled && probeMgr != nil && url == probeMgr.ProbeLatencyURL() {
+				scriptEngine = probeScriptEngine(cfgSnap.ProbeScriptBuild, cfgSnap.ProbeScriptJudge)
+			}
+
+			opts := netutil.OutboundHTTPOptions{
+				AcceptStatus: func(code int) bool {
+					for _, rc := range reject {
+						if rc == code {
+							return false
+						}
+					}
+					return true
+				},
 				OnConnLifecycle: func(op netutil.ConnLifecycleOp) {
 					if onProbeConnLifecycle != nil {
 						onProbeConnLifecycle(op)
 					}
 				},
-			})
+			}
+			// Script-built request wins over the declarative template: the
+			// script exists precisely to express what a template cannot.
+			scriptBuilt := false
+			if scriptEngine != nil && scriptEngine.Enabled() {
+				if built, err := scriptEngine.BuildRequest(scriptCtx); err == nil {
+					opts.Method = built.Method
+					opts.Body = []byte(built.Body)
+					opts.Header = built.Headers
+					// The script owns the target too: a probe that can only
+					// change headers would still hit the old endpoint, which is
+					// exactly the case this feature exists to fix.
+					if built.URL != "" {
+						url = built.URL
+					}
+					scriptBuilt = true
+				} else {
+					log.Printf("[probe] build script failed for %s, falling back to template: %v", hash.Hex(), err)
+				}
+			}
+			if !scriptBuilt && !tpl.IsZero() {
+				opts.Method = tpl.Method
+				opts.Body = []byte(tpl.Body)
+				opts.Header = tpl.Headers
+			}
+
+			// A judge script overrides the built-in status/body rules: only it
+			// knows what a healthy payload looks like for this upstream.
+			judging := scriptEngine != nil && scriptEngine.ShouldJudge()
+			statusCode := 0
+			if judging {
+				opts.AcceptStatus = nil // judged below, with full context
+				opts.AcceptBody = nil
+				opts.OnStatus = func(code int) { statusCode = code }
+			} else if len(markers) > 0 {
+				opts.AcceptBody = func(body []byte) bool {
+					return !bodyContainsAny(body, markers)
+				}
+			}
+
+			body, latency, fetchErr := netutil.HTTPGetViaOutbound(ctx, *outboundPtr, url, opts)
+			if judging && fetchErr == nil {
+				verdict, jerr := scriptEngine.Judge(scriptCtx, statusCode, body)
+				if jerr != nil {
+					log.Printf("[probe] judge script failed for %s: %v", hash.Hex(), jerr)
+				} else if !verdict.OK {
+					return body, latency, fmt.Errorf("probe judge rejected: %s", verdict.Reason)
+				}
+			}
+			return body, latency, fetchErr
 		},
 		MaxEgressTestInterval: func() time.Duration {
 			return time.Duration(runtimeConfigSnapshot(runtimeCfg).MaxEgressTestInterval)
@@ -284,6 +445,15 @@ func newTopologyRuntime(
 		},
 		LatencyAuthorities: func() []string {
 			return runtimeConfigSnapshot(runtimeCfg).LatencyAuthorities
+		},
+		RejectStatusCodes: func() []int {
+			return runtimeConfigSnapshot(runtimeCfg).ProbeRejectStatusCodes
+		},
+		RequestTemplate: func() config.ProbeRequestTemplate {
+			return runtimeConfigSnapshot(runtimeCfg).ProbeRequest
+		},
+		RejectBodySubstrings: func() []string {
+			return runtimeConfigSnapshot(runtimeCfg).ProbeRejectBodySubstrings
 		},
 	})
 

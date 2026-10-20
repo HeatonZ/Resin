@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"github.com/Resinat/Resin/internal/geoip"
 	"github.com/Resinat/Resin/internal/netutil"
 	"github.com/Resinat/Resin/internal/probe"
+	"github.com/Resinat/Resin/internal/probescript"
 	"github.com/Resinat/Resin/internal/proxy"
 	"github.com/Resinat/Resin/internal/routing"
 	"github.com/Resinat/Resin/internal/state"
@@ -86,6 +88,12 @@ var runtimeConfigAllowedFields = map[string]bool{
 	"max_egress_test_interval":                 true,
 	"latency_test_url":                         true,
 	"latency_authorities":                      true,
+	"probe_reject_status_codes":                true,
+	"probe_request":                            true,
+	"probe_reject_body_substrings":             true,
+	"probe_script_build":                       true,
+	"probe_script_judge":                       true,
+	"probe_script_enabled":                     true,
 	"p2c_latency_window":                       true,
 	"latency_decay_window":                     true,
 	"cache_flush_interval":                     true,
@@ -147,6 +155,17 @@ func copyRuntimeConfig(cfg *config.RuntimeConfig) *config.RuntimeConfig {
 	}
 	out := *cfg
 	out.LatencyAuthorities = append([]string(nil), cfg.LatencyAuthorities...)
+	out.ProbeRejectStatusCodes = append([]int(nil), cfg.ProbeRejectStatusCodes...)
+	out.ProbeRejectBodySubstrings = append([]string(nil), cfg.ProbeRejectBodySubstrings...)
+	// Strings are immutable in Go, so the script fields copy by value safely;
+	// no extra work is needed beyond the struct copy above.
+	if len(cfg.ProbeRequest.Headers) > 0 {
+		headers := make(map[string]string, len(cfg.ProbeRequest.Headers))
+		for k, v := range cfg.ProbeRequest.Headers {
+			headers[k] = v
+		}
+		out.ProbeRequest.Headers = headers
+	}
 	return &out
 }
 
@@ -208,6 +227,29 @@ func validateRuntimeConfig(cfg *config.RuntimeConfig) *ServiceError {
 	if cfg.MaxConsecutiveFailures < 0 {
 		return invalidArg("max_consecutive_failures: must be non-negative")
 	}
+	// Status codes must be plausible HTTP codes; an out-of-range value would
+	// silently never match and disable rejection for that code.
+	for _, code := range cfg.ProbeRejectStatusCodes {
+		if code < 100 || code > 599 {
+			return invalidArg("probe_reject_status_codes: each entry must be a valid HTTP status code (100-599)")
+		}
+	}
+	// The probe template is operator-supplied input that is sent verbatim
+	// through every node, so bound it: a huge body would multiply across the
+	// whole pool on every probe cycle.
+	if err := validateProbeRequestTemplate(cfg.ProbeRequest); err != nil {
+		return err.(*ServiceError)
+	}
+	for _, marker := range cfg.ProbeRejectBodySubstrings {
+		if len(marker) > maxProbeRejectMarkerLen {
+			return invalidArg("probe_reject_body_substrings: each marker must be at most 256 bytes")
+		}
+	}
+	// A script that does not compile must be rejected at save time, not
+	// discovered later as a silently disabled probe.
+	if err := validateProbeScripts(cfg); err != nil {
+		return err
+	}
 	if cfg.CacheFlushDirtyThreshold < 0 {
 		return invalidArg("cache_flush_dirty_threshold: must be non-negative")
 	}
@@ -258,6 +300,75 @@ func validateRuntimeConfig(cfg *config.RuntimeConfig) *ServiceError {
 		}
 		if !found {
 			cfg.LatencyAuthorities = append(cfg.LatencyAuthorities, latencyDomain)
+		}
+	}
+	return nil
+}
+
+// maxProbeScriptLen bounds an operator script. The scripts run on every probe
+// cycle across the whole pool; an unbounded script is a self-inflicted DoS.
+const maxProbeScriptLen = 16 * 1024
+
+// validateProbeScripts compiles the operator scripts so a syntax error is
+// caught at save time. Without this, a broken script would only show up as a
+// probe that quietly falls back to default behaviour.
+func validateProbeScripts(cfg *config.RuntimeConfig) *ServiceError {
+	for name, src := range map[string]string{
+		"probe_script_build": cfg.ProbeScriptBuild,
+		"probe_script_judge": cfg.ProbeScriptJudge,
+	} {
+		if len(src) > maxProbeScriptLen {
+			return invalidArg(name + ": script must be at most 16384 bytes")
+		}
+		if strings.TrimSpace(src) == "" {
+			continue
+		}
+		if err := probescript.Compile(src); err != nil {
+			return invalidArg(name + ": " + err.Error())
+		}
+	}
+	return nil
+}
+
+const (
+	// maxProbeRequestBodyLen bounds the probe request body. The template is
+	// replayed through every probed node, so an unbounded body would be
+	// multiplied across the whole pool on each cycle.
+	maxProbeRequestBodyLen = 8 * 1024
+	// maxProbeRequestHeaderLen bounds a single header value.
+	maxProbeRequestHeaderLen = 4 * 1024
+	// maxProbeRejectMarkerLen bounds one body marker.
+	maxProbeRejectMarkerLen = 256
+)
+
+// allowedProbeMethods are the methods a probe may use. Restricted to the verbs
+// a read-only health check needs: a probe must never mutate upstream state.
+var allowedProbeMethods = map[string]bool{
+	http.MethodGet:  true,
+	http.MethodHead: true,
+	http.MethodPost: true,
+}
+
+// validateProbeRequestTemplate rejects templates that are unsafe or unbounded.
+func validateProbeRequestTemplate(tpl config.ProbeRequestTemplate) error {
+	if tpl.IsZero() {
+		return nil
+	}
+	if tpl.Method != "" {
+		method := strings.ToUpper(strings.TrimSpace(tpl.Method))
+		if !allowedProbeMethods[method] {
+			return invalidArg("probe_request.method: only GET, HEAD and POST are allowed")
+		}
+	}
+	if len(tpl.Body) > maxProbeRequestBodyLen {
+		return invalidArg("probe_request.body: must be at most 8192 bytes")
+	}
+	for name, value := range tpl.Headers {
+		if strings.TrimSpace(name) == "" {
+			return invalidArg("probe_request.headers: header name must not be empty")
+		}
+		if len(value) > maxProbeRequestHeaderLen {
+			return invalidArg("probe_request.headers: each header value must be at most 4096 bytes")
 		}
 	}
 	return nil

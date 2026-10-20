@@ -1,6 +1,7 @@
 package netutil
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -28,6 +29,29 @@ const (
 type OutboundHTTPOptions struct {
 	// RequireStatusOK enforces HTTP 200 status; otherwise any status is accepted.
 	RequireStatusOK bool
+	// AcceptStatus, when non-nil, overrides RequireStatusOK: the response is
+	// accepted only when AcceptStatus(statusCode) returns true. Probes use this
+	// to reject gate responses (403/429/5xx) that still arrive over a working
+	// TCP/TLS path — a node that answers 502 is not healthy just because it
+	// answered.
+	AcceptStatus func(statusCode int) bool
+	// AcceptBody, when non-nil, gets the (already read) response body and can
+	// reject it. Status alone cannot tell a healthy node from a gated one when
+	// the gate answers 200 with an error document in the body, so a probe that
+	// replays a real request needs to inspect the payload too.
+	AcceptBody func(body []byte) bool
+	// OnStatus receives the HTTP status code as soon as headers arrive. Callers
+	// that judge the response themselves (a script) need the real code; the
+	// return values only carry body and latency.
+	OnStatus func(statusCode int)
+	// Method overrides the request method; empty means GET.
+	Method string
+	// Body is the request body sent with the request (nil for GET).
+	Body []byte
+	// Header carries extra request headers (e.g. Content-Type, auth, client
+	// identity headers a real client would send). The User-Agent set below
+	// wins over any User-Agent supplied here.
+	Header map[string]string
 	// UserAgent overrides the request User-Agent when non-empty.
 	UserAgent string
 	// OnConnLifecycle is called with open/close lifecycle events to track connection
@@ -68,7 +92,16 @@ func HTTPGetViaOutbound(
 		Transport: transport,
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	method := opts.Method
+	if method == "" {
+		method = http.MethodGet
+	}
+	var bodyReader io.Reader
+	if len(opts.Body) > 0 {
+		bodyReader = bytes.NewReader(opts.Body)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -76,6 +109,9 @@ func HTTPGetViaOutbound(
 	userAgent := opts.UserAgent
 	if userAgent == "" {
 		userAgent = defaultOutboundUserAgent
+	}
+	for k, v := range opts.Header {
+		req.Header.Set(k, v)
 	}
 	req.Header.Set("User-Agent", userAgent)
 
@@ -97,13 +133,25 @@ func HTTPGetViaOutbound(
 	}
 	defer resp.Body.Close()
 
-	if opts.RequireStatusOK && resp.StatusCode != http.StatusOK {
+	if opts.OnStatus != nil {
+		opts.OnStatus(resp.StatusCode)
+	}
+
+	if opts.AcceptStatus != nil {
+		if !opts.AcceptStatus(resp.StatusCode) {
+			return nil, latency, fmt.Errorf("outbound fetch: rejected status %d from %s", resp.StatusCode, url)
+		}
+	} else if opts.RequireStatusOK && resp.StatusCode != http.StatusOK {
 		return nil, latency, fmt.Errorf("outbound fetch: unexpected status %d from %s", resp.StatusCode, url)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, latency, err
+	}
+
+	if opts.AcceptBody != nil && !opts.AcceptBody(body) {
+		return nil, latency, fmt.Errorf("outbound fetch: rejected body from %s (len=%d)", url, len(body))
 	}
 
 	return body, latency, nil

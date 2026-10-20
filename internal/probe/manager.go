@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Resinat/Resin/internal/config"
 	"github.com/Resinat/Resin/internal/netutil"
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/scanloop"
@@ -40,6 +41,20 @@ type ProbeConfig struct {
 	LatencyTestURL     func() string
 	LatencyAuthorities func() []string
 
+	// RejectStatusCodes returns the HTTP status codes that count as a failed
+	// probe even when the request completed. A node behind an upstream gate
+	// answers 403/429/5xx over a working TCP/TLS path, so "we got a response"
+	// is not evidence of health. Empty or nil means no status-based rejection.
+	RejectStatusCodes func() []int
+
+	// RequestTemplate returns the optional HTTP probe template (method, body,
+	// headers). When set, the probe replays the real business request instead
+	// of a bare GET, which is the only way to see what traffic actually sees.
+	RequestTemplate func() config.ProbeRequestTemplate
+	// RejectBodySubstrings returns body markers that mark a probe as failed even
+	// on a 200 response (gates that answer 200 with an error document).
+	RejectBodySubstrings func() []string
+
 	// OnProbeEvent is called after each probe attempt completes (egress or latency).
 	// The kind parameter is "egress" or "latency".
 	OnProbeEvent func(kind string)
@@ -67,6 +82,9 @@ type ProbeManager struct {
 	maxAuthorityLatencyTestInterval func() time.Duration
 	latencyTestURL                  func() string
 	latencyAuthorities              func() []string
+	rejectStatusCodes               func() []int
+	requestTemplate                 func() config.ProbeRequestTemplate
+	rejectBodySubstrings            func() []string
 	onProbeEvent                    func(kind string)
 }
 
@@ -269,6 +287,9 @@ func NewProbeManager(cfg ProbeConfig) *ProbeManager {
 		maxAuthorityLatencyTestInterval: cfg.MaxAuthorityLatencyTestInterval,
 		latencyTestURL:                  cfg.LatencyTestURL,
 		latencyAuthorities:              cfg.LatencyAuthorities,
+		rejectStatusCodes:               cfg.RejectStatusCodes,
+		requestTemplate:                 cfg.RequestTemplate,
+		rejectBodySubstrings:            cfg.RejectBodySubstrings,
 		onProbeEvent:                    cfg.OnProbeEvent,
 	}
 }
@@ -815,6 +836,14 @@ func (m *ProbeManager) performLatencyProbe(hash node.Hash, testURL string) error
 	m.pool.RecordResult(hash, true)
 	m.pool.RecordLatency(hash, domain, &latency)
 	return nil
+}
+
+// ProbeLatencyURL reports the URL the latency probe targets. Callers that share
+// one fetcher between the egress probe (which must parse a Cloudflare trace body
+// to learn the egress IP) and the latency probe need this to tell them apart:
+// rewriting the egress request would silently stop egress-IP discovery.
+func (m *ProbeManager) ProbeLatencyURL() string {
+	return m.currentLatencyTestURL()
 }
 
 func (m *ProbeManager) currentLatencyTestURL() string {
