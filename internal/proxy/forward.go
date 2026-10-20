@@ -306,8 +306,16 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Full body transfer succeeded — count as network success even for 5xx HTTP.
+	// Status codes that are ambiguous about node health are the exception: they
+	// record nothing so the node's failure streak and circuit state survive.
 	if hasRoute {
-		recordPassiveResultAsync(p.health, route, true)
+		verdict := passiveSuccess
+		if ignoreCfg, ok := p.events.(interface {
+			reverseDetailCaptureConfig() reverseDetailCaptureConfig
+		}); ok {
+			verdict = passiveVerdictForStatus(resp.StatusCode, ignoreCfg.reverseDetailCaptureConfig().PassiveIgnoreStatusCodes)
+		}
+		recordPassiveVerdictAsync(p.health, route, verdict)
 	}
 }
 

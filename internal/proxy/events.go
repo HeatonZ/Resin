@@ -108,6 +108,10 @@ type ConfigAwareEventEmitter struct {
 	ReverseProxyLogReqBodyMaxBytes     func() int
 	ReverseProxyLogRespHeadersMaxBytes func() int
 	ReverseProxyLogRespBodyMaxBytes    func() int
+
+	// PassiveIgnoreStatusCodes returns status codes that carry no verdict on
+	// node health (hot-reload friendly).
+	PassiveIgnoreStatusCodes func() []int
 }
 
 type reverseDetailCaptureConfig struct {
@@ -116,6 +120,9 @@ type reverseDetailCaptureConfig struct {
 	ReqBodyMaxBytes     int
 	RespHeadersMaxBytes int
 	RespBodyMaxBytes    int
+	// PassiveIgnoreStatusCodes lists status codes that must not count as
+	// evidence of node health (see RuntimeConfig.PassiveIgnoreStatusCodes).
+	PassiveIgnoreStatusCodes []int
 }
 
 func (e ConfigAwareEventEmitter) emitBase() EventEmitter {
@@ -150,6 +157,11 @@ func (e ConfigAwareEventEmitter) reverseDetailCaptureConfig() reverseDetailCaptu
 	}
 	if e.ReverseProxyLogRespBodyMaxBytes != nil {
 		cfg.RespBodyMaxBytes = e.ReverseProxyLogRespBodyMaxBytes()
+	}
+	if e.PassiveIgnoreStatusCodes != nil {
+		// Copy: the closure reads a live config pointer that a hot reload can
+		// replace mid-request.
+		cfg.PassiveIgnoreStatusCodes = append([]int(nil), e.PassiveIgnoreStatusCodes()...)
 	}
 	return cfg
 }

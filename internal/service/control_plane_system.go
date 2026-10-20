@@ -90,6 +90,7 @@ var runtimeConfigAllowedFields = map[string]bool{
 	"latency_authorities":                      true,
 	"probe_reject_status_codes":                true,
 	"probe_reject_only_unreachable":            true,
+	"passive_ignore_status_codes":              true,
 	"probe_request":                            true,
 	"probe_reject_body_substrings":             true,
 	"probe_script_build":                       true,
@@ -157,6 +158,7 @@ func copyRuntimeConfig(cfg *config.RuntimeConfig) *config.RuntimeConfig {
 	out := *cfg
 	out.LatencyAuthorities = append([]string(nil), cfg.LatencyAuthorities...)
 	out.ProbeRejectStatusCodes = append([]int(nil), cfg.ProbeRejectStatusCodes...)
+	out.PassiveIgnoreStatusCodes = append([]int(nil), cfg.PassiveIgnoreStatusCodes...)
 	out.ProbeRejectBodySubstrings = append([]string(nil), cfg.ProbeRejectBodySubstrings...)
 	// Secrets are a map, so a struct copy would share the backing store: a hot
 	// config swap would then race with a probe cycle reading them.
@@ -242,6 +244,11 @@ func validateRuntimeConfig(cfg *config.RuntimeConfig) *ServiceError {
 	for _, code := range cfg.ProbeRejectStatusCodes {
 		if code < 100 || code > 599 {
 			return invalidArg("probe_reject_status_codes: each entry must be a valid HTTP status code (100-599)")
+		}
+	}
+	for _, code := range cfg.PassiveIgnoreStatusCodes {
+		if code < 100 || code > 599 {
+			return invalidArg("passive_ignore_status_codes: each entry must be a valid HTTP status code (100-599)")
 		}
 	}
 	// The probe template is operator-supplied input that is sent verbatim

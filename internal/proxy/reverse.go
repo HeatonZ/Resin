@@ -402,9 +402,17 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// Further attribution for mid-body stream failures is expensive and noisy
 			// (client abort vs upstream reset vs network blip), and the added
 			// complexity is not worth it for the current phase.
+			//
+			// Exception: status codes that are ambiguous about node health. A
+			// gated upstream answers 403 both when this egress is blocked and
+			// when the request lacks the identity it demands, so the status
+			// alone is not evidence. Recording success there would reset
+			// FailureCount and clear the circuit breaker, laundering a blocked
+			// egress back into rotation.
 			lifecycle.setNetOK(true)
 			if hasRoute {
-				recordPassiveResultAsync(p.health, route, true)
+				verdict := passiveVerdictForStatus(resp.StatusCode, detailCfg.PassiveIgnoreStatusCodes)
+				recordPassiveVerdictAsync(p.health, route, verdict)
 			}
 			return nil
 		},

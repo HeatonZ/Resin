@@ -517,6 +517,9 @@ func (a *resinApp) buildProxyEvents() proxy.ConfigAwareEventEmitter {
 		ReverseProxyLogRespBodyMaxBytes: func() int {
 			return runtimeConfigSnapshot(a.runtimeCfg).ReverseProxyLogRespBodyMaxBytes
 		},
+		PassiveIgnoreStatusCodes: func() []int {
+			return runtimeConfigSnapshot(a.runtimeCfg).PassiveIgnoreStatusCodes
+		},
 	}
 }
 

@@ -54,6 +54,19 @@ type RuntimeConfig struct {
 	// the probe; a completed HTTP exchange counts as reachable regardless of the
 	// status code. Use this when the probe cannot carry credentials.
 	ProbeRejectOnlyUnreachable bool `json:"probe_reject_only_unreachable"`
+	// PassiveIgnoreStatusCodes lists upstream status codes that carry no
+	// verdict about node health, so passive feedback must record neither
+	// success nor failure for them.
+	//
+	// A 403 from a gated upstream has two possible meanings that share the same
+	// status code: "this egress is blocked" (a node problem) and "this request
+	// lacks the client identity the gate requires" (a configuration problem).
+	// Recording it as success resets FailureCount and clears the circuit
+	// breaker, which launders a blocked egress back into rotation; recording it
+	// as failure punishes a healthy node for a request-shape mistake. Neither
+	// is evidence, so the honest answer is to record nothing and leave the
+	// node's state untouched. Empty disables the rule.
+	PassiveIgnoreStatusCodes []int `json:"passive_ignore_status_codes"`
 	// ProbeRequest is an optional HTTP probe template. A bare GET of a website
 	// root answers 200 for every node, so a gated node looks identical to a
 	// healthy one; replaying the real business request (method, body, client
@@ -110,6 +123,9 @@ func (c *RuntimeConfig) ApplyMissingDefaults() {
 	if c.ProbeRejectStatusCodes == nil {
 		c.ProbeRejectStatusCodes = def.ProbeRejectStatusCodes
 	}
+	if c.PassiveIgnoreStatusCodes == nil {
+		c.PassiveIgnoreStatusCodes = def.PassiveIgnoreStatusCodes
+	}
 	if c.LatencyAuthorities == nil {
 		c.LatencyAuthorities = def.LatencyAuthorities
 	}
@@ -137,6 +153,12 @@ func NewDefaultRuntimeConfig() *RuntimeConfig {
 		// counting it as a healthy probe is what let fully-gated nodes stay in
 		// rotation. Defaults are the codes observed from the free-tier gate.
 		ProbeRejectStatusCodes: []int{403, 429, 500, 502, 503, 504},
+		// A gated upstream answers 403 both for a blocked egress and for a
+		// request missing the client identity the gate requires, so passive
+		// traffic cannot use it as evidence either way. Leave the node's
+		// state untouched rather than laundering it (success) or condemning
+		// it (failure).
+		PassiveIgnoreStatusCodes: []int{403},
 
 		P2CLatencyWindow:   Duration(10 * time.Minute),
 		LatencyDecayWindow: Duration(10 * time.Minute),
