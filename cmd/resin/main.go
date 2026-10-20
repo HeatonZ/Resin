@@ -84,13 +84,52 @@ func loadRuntimeConfig(engine *state.StateEngine) *config.RuntimeConfig {
 	}
 	if runtimeCfg == nil {
 		log.Println("No persisted runtime config found, using defaults")
-		return config.NewDefaultRuntimeConfig()
+		// Defaults must still receive the environment secrets: a fresh
+		// deployment has no persisted row at all, and returning early here
+		// would leave the probe unable to authenticate.
+		def := config.NewDefaultRuntimeConfig()
+		def.ProbeScriptSecrets = loadProbeSecretsFromEnv()
+		if n := len(def.ProbeScriptSecrets); n > 0 {
+			log.Printf("Loaded %d probe script secret(s) from environment", n)
+		}
+		return def
 	}
 	log.Printf("Loaded persisted runtime config (version %d)", ver)
 	// Older rows predate fields added later; adopt their defaults rather than
 	// starting with nil and silently disabling the new probe rules.
 	runtimeCfg.ApplyMissingDefaults()
+	// Credentials never live in the persisted blob (json:"-"), so they are
+	// re-injected from the environment on every start.
+	runtimeCfg.ProbeScriptSecrets = loadProbeSecretsFromEnv()
+	if n := len(runtimeCfg.ProbeScriptSecrets); n > 0 {
+		log.Printf("Loaded %d probe script secret(s) from environment", n)
+	}
 	return runtimeCfg
+}
+
+// loadProbeSecretsFromEnv collects RESIN_PROBE_SECRET_<NAME> variables into the
+// map scripts read as ctx.env.<name>. The prefix keeps them distinguishable
+// from ordinary configuration, and reading them here means the credential is
+// never written to state.db or returned by GET /system/config.
+func loadProbeSecretsFromEnv() map[string]string {
+	const prefix = "RESIN_PROBE_SECRET_"
+	out := map[string]string{}
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, prefix) {
+			continue
+		}
+		name, value, ok := strings.Cut(strings.TrimPrefix(kv, prefix), "=")
+		if !ok || name == "" || value == "" {
+			continue
+		}
+		// Scripts index ctx.env by the lowercased suffix, matching the
+		// lowercase style of every other context key.
+		out[strings.ToLower(name)] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func newDirectDownloader(
@@ -129,6 +168,20 @@ func rejectStatusSnapshot(codes []int) []int {
 	}
 	out := make([]int, len(codes))
 	copy(out, codes)
+	return out
+}
+
+// probeSecretsSnapshot copies the credential map so a probe cycle reads a
+// stable view while the config can be hot-swapped underneath it. Copying also
+// keeps the script from mutating the live config through a shared map.
+func probeSecretsSnapshot(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
 	return out
 }
 
@@ -357,6 +410,11 @@ func newTopologyRuntime(
 				NodeHash: hash.Hex(),
 				BaseURL:  url,
 				NowUnix:  time.Now().Unix(),
+				// Secrets reach the script as ctx.env. This is the only way a
+				// probe can carry real credentials: without them the upstream
+				// answers the same 403 for a blocked egress and for a request
+				// that simply has no identity, so no rule can tell them apart.
+				Env: probeSecretsSnapshot(cfgSnap.ProbeScriptSecrets),
 			}
 			var scriptEngine *probescript.Engine
 			// Only the latency probe replays the business request. The egress

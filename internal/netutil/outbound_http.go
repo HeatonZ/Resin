@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +18,18 @@ import (
 )
 
 const defaultOutboundUserAgent = "Resin/1.0"
+
+// headerHasKey reports whether the header map already carries name, ignoring
+// case: a script may spell it "user-agent" and http.Header.Set would then
+// normalise it into the same slot the default would overwrite.
+func headerHasKey(h map[string]string, name string) bool {
+	for k := range h {
+		if strings.EqualFold(k, name) {
+			return true
+		}
+	}
+	return false
+}
 
 type ConnLifecycleOp uint8
 
@@ -113,7 +126,13 @@ func HTTPGetViaOutbound(
 	for k, v := range opts.Header {
 		req.Header.Set(k, v)
 	}
-	req.Header.Set("User-Agent", userAgent)
+	// The script's own User-Agent must win: upstreams that gate on client
+	// identity read this header, so forcing the default here would silently
+	// turn every scripted request back into a generic one. Header names from a
+	// script are arbitrary case, so compare case-insensitively.
+	if !headerHasKey(opts.Header, "User-Agent") {
+		req.Header.Set("User-Agent", userAgent)
+	}
 
 	var start time.Time
 	var latency time.Duration

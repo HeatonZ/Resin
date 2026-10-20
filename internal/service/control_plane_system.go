@@ -158,6 +158,15 @@ func copyRuntimeConfig(cfg *config.RuntimeConfig) *config.RuntimeConfig {
 	out.LatencyAuthorities = append([]string(nil), cfg.LatencyAuthorities...)
 	out.ProbeRejectStatusCodes = append([]int(nil), cfg.ProbeRejectStatusCodes...)
 	out.ProbeRejectBodySubstrings = append([]string(nil), cfg.ProbeRejectBodySubstrings...)
+	// Secrets are a map, so a struct copy would share the backing store: a hot
+	// config swap would then race with a probe cycle reading them.
+	if len(cfg.ProbeScriptSecrets) > 0 {
+		secrets := make(map[string]string, len(cfg.ProbeScriptSecrets))
+		for k, v := range cfg.ProbeScriptSecrets {
+			secrets[k] = v
+		}
+		out.ProbeScriptSecrets = secrets
+	}
 	// Strings are immutable in Go, so the script fields copy by value safely;
 	// no extra work is needed beyond the struct copy above.
 	if len(cfg.ProbeRequest.Headers) > 0 {

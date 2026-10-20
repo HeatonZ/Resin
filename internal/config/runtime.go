@@ -76,6 +76,16 @@ type RuntimeConfig struct {
 	// ProbeScriptEnabled gates both scripts. Off by default: an operator script
 	// runs across the whole pool, so it must be an explicit opt-in.
 	ProbeScriptEnabled bool `json:"probe_script_enabled"`
+	// ProbeScriptSecrets are key/value pairs exposed to the scripts as
+	// ctx.secrets. This is where upstream credentials belong: the probe needs
+	// them to tell "this egress is blocked" from "this request carries no
+	// identity", and the two are otherwise byte-identical.
+	//
+	// json:"-" keeps them out of GET /system/config and out of the persisted
+	// config blob, so a credential never leaks through the API or a state.db
+	// dump. They are supplied once per process via RESIN_PROBE_SECRET_<NAME>
+	// and are write-only: the PATCH response reports names, never values.
+	ProbeScriptSecrets map[string]string `json:"-"`
 
 	// P2C
 	P2CLatencyWindow   Duration `json:"p2c_latency_window"`
