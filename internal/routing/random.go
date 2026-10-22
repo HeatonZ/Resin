@@ -86,43 +86,22 @@ func randomRoute(
 		return node.Zero, ErrNoAvailableNodes
 	}
 
-	pick := func() (node.Hash, bool) {
-		return view.RandomPick(rng)
+	// Sample k distinct candidates. k defaults to 3 (see candidateSamples) so the
+	// score gets one more chance per allocation to reject a slow or penalised node;
+	// RESIN_P2C_CANDIDATES=2 restores the plain pairwise P2C behaviour.
+	k := candidateSamples()
+	if size < k {
+		k = size
 	}
-
-	// Pick 1st candidate.
-	h1, ok1 := pick()
-	if !ok1 {
+	candidates := sampleCandidates(view, rng, k)
+	if len(candidates) == 0 {
 		return node.Zero, ErrNoAvailableNodes
 	}
-
-	// If view has one node, use it directly.
-	if size == 1 {
-		return h1, nil
+	if len(candidates) == 1 {
+		return candidates[0], nil
 	}
 
-	// Pick 2nd candidate; best-effort to make it distinct.
-	h2, ok2 := pick()
-	if !ok2 {
-		return h1, nil
-	}
-	if h2 == h1 {
-		for i := 0; i < 3; i++ {
-			candidate, ok := pick()
-			if !ok {
-				break
-			}
-			if candidate != h1 {
-				h2 = candidate
-				break
-			}
-		}
-		if h2 == h1 {
-			return h1, nil
-		}
-	}
-
-	return chooseByScore(h1, h2, plat, stats, pool, targetDomain, authorities, p2cWindow)
+	return chooseBest(candidates, plat, stats, pool, targetDomain, authorities, p2cWindow)
 }
 
 func samplePair(rng *rand.Rand, candidate node.Hash, count int, first, second *node.Hash) {
