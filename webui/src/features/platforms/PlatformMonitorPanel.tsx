@@ -463,12 +463,28 @@ async function fetchPlatformSnapshotNodeLatency(platformId: string): Promise<Sna
   return normalizeNodeLatencySnapshot(data);
 }
 
+// Recharts injects these props at runtime; only describe the fields each tooltip reads.
+type TrendTooltipEntry = {
+  dataKey?: string | number;
+  value?: number | string;
+};
+
 type TrendTooltipContentProps = {
   active?: boolean;
-  payload?: any[];
+  payload?: ReadonlyArray<TrendTooltipEntry>;
   label?: string;
   lines: TrendLineDefinition[];
   valueFormatter: (value: number) => string;
+};
+
+type HistogramTooltipEntry = {
+  value?: number | string;
+  payload?: HistogramBarPoint;
+};
+
+type HistogramTooltipContentProps = {
+  active?: boolean;
+  payload?: ReadonlyArray<HistogramTooltipEntry>;
 };
 
 function TrendTooltipContent({ active, payload, label, lines, valueFormatter }: TrendTooltipContentProps) {
@@ -500,14 +516,14 @@ function TrendTooltipContent({ active, payload, label, lines, valueFormatter }: 
   );
 }
 
-function HistogramTooltipContent({ active, payload }: any) {
+function HistogramTooltipContent({ active, payload }: HistogramTooltipContentProps) {
   const { t } = useI18n();
 
   if (!active || !payload?.length) {
     return null;
   }
 
-  const point = payload[0]?.payload as HistogramBarPoint | undefined;
+  const point = payload[0]?.payload;
   const count = Number(payload[0]?.value ?? point?.count ?? 0);
   const safeCount = Number.isFinite(count) ? count : 0;
   const lowerBound = typeof point?.lower_ms === "number" && Number.isFinite(point.lower_ms) ? point.lower_ms : 0;

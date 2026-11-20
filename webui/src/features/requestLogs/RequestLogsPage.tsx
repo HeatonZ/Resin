@@ -68,6 +68,11 @@ const CONTENT_ENCODING_DECODE_FAILED_PREFIX = "Content-Encoding=";
 const CONTENT_ENCODING_DECODE_FAILED_SUFFIX = " 解压失败";
 const RELAY_NOT_RECORDED_HINT = "链式代理已启用，但本次请求未能记录线路节点。部分协议或连接建立失败时可能出现此情况。";
 
+type TranslateFn = (text: string, options?: Record<string, unknown>) => string;
+type PayloadView = { headers: string; body: string };
+type DecodedPayloadView = { key: string; view: PayloadView };
+const EMPTY_PAYLOAD_VIEW: PayloadView = { headers: "", body: "" };
+
 function LogNodeInfo({ log }: { log: RequestLogItem }) {
   const { t } = useI18n();
   const renderNode = (tag: string, hash = "") => tag ? (
@@ -385,6 +390,24 @@ function proxyTypeBadgeClassName(proxyType: number): string | null {
   return null;
 }
 
+function renderProxyTypeBadge(t: TranslateFn, proxyType: number, context: "table" | "drawer" = "table") {
+  const className = proxyTypeBadgeClassName(proxyType);
+  if (!className) {
+    return t(proxyTypeLabel(proxyType));
+  }
+
+  let label = "";
+  if (proxyType === 1) {
+    label = context === "drawer" ? t("HTTP") : t("正向");
+  } else if (proxyType === 2) {
+    label = t("反向");
+  } else {
+    label = t("SOCKS5");
+  }
+
+  return <Badge className={className}>{label}</Badge>;
+}
+
 function dateLocale(): string {
   return isEnglishLocale(getCurrentLocale()) ? "en-US" : "zh-CN";
 }
@@ -430,11 +453,7 @@ export function RequestLogsPage() {
   const [selectedLogId, setSelectedLogId] = useState("");
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [payloadTab, setPayloadTab] = useState<PayloadTab>("request");
-  const [payloadData, setPayloadData] = useState<{ headers: string; body: string }>({
-    headers: "",
-    body: "",
-  });
-  const [payloadDecodePending, setPayloadDecodePending] = useState(false);
+  const [decodedPayload, setDecodedPayload] = useState<DecodedPayloadView | null>(null);
   const { toasts, dismissToast } = useToast();
 
   const configQuery = useQuery({
@@ -529,6 +548,14 @@ export function RequestLogsPage() {
     staleTime: 30_000,
   });
 
+  // Decoded payload is cached per log+tab so the drawer can render the "empty/decoding"
+  // placeholder directly from state instead of resetting state inside an effect.
+  const payloadDecodeKey = payloadQuery.data ? `${detailLogId}:${payloadTab}` : "";
+  const decodedPayloadView =
+    decodedPayload && decodedPayload.key === payloadDecodeKey ? decodedPayload.view : null;
+  const payloadData = decodedPayloadView ?? EMPTY_PAYLOAD_VIEW;
+  const payloadDecodePending = payloadDecodeKey !== "" && decodedPayloadView === null;
+
   useEffect(() => {
     if (!drawerVisible) {
       return;
@@ -603,17 +630,13 @@ export function RequestLogsPage() {
   useEffect(() => {
     let cancelled = false;
     const payload = payloadQuery.data;
+    const decodeKey = payloadDecodeKey;
 
     if (!payload) {
-      setPayloadData({ headers: "", body: "" });
-      setPayloadDecodePending(false);
       return () => {
         cancelled = true;
       };
     }
-
-    setPayloadData({ headers: "", body: "" });
-    setPayloadDecodePending(true);
 
     const decodePayload = async () => {
       const [headersBase64, bodyBase64] =
@@ -629,8 +652,7 @@ export function RequestLogsPage() {
       if (cancelled) {
         return;
       }
-      setPayloadData({ headers, body });
-      setPayloadDecodePending(false);
+      setDecodedPayload({ key: decodeKey, view: { headers, body } });
     };
 
     void decodePayload().catch((error: unknown) => {
@@ -638,33 +660,18 @@ export function RequestLogsPage() {
         return;
       }
       const message = error instanceof Error ? translatePayloadDecodeErrorMessage(error.message, t) : t("未知错误");
-      setPayloadData({ headers: "", body: t("[Body 解码失败：{{message}}]", { message }) });
-      setPayloadDecodePending(false);
+      setDecodedPayload({
+        key: decodeKey,
+        view: { headers: "", body: t("[Body 解码失败：{{message}}]", { message }) },
+      });
     });
 
     return () => {
       cancelled = true;
     };
-  }, [payloadQuery.data, payloadTab, t]);
+  }, [payloadQuery.data, payloadDecodeKey, payloadTab, t]);
 
   const hasMore = Boolean(logsQuery.data?.has_more && logsQuery.data?.next_cursor);
-  const renderProxyTypeBadge = (proxyType: number, context: "table" | "drawer" = "table") => {
-    const className = proxyTypeBadgeClassName(proxyType);
-    if (!className) {
-      return t(proxyTypeLabel(proxyType));
-    }
-
-    let label = "";
-    if (proxyType === 1) {
-      label = context === "drawer" ? t("HTTP") : t("正向");
-    } else if (proxyType === 2) {
-      label = t("反向");
-    } else {
-      label = t("SOCKS5");
-    }
-
-    return <Badge className={className}>{label}</Badge>;
-  };
 
   const col = useMemo(() => createColumnHelper<RequestLogItem>(), []);
 
@@ -684,7 +691,7 @@ export function RequestLogsPage() {
       }),
       col.accessor("proxy_type", {
         header: t("代理"),
-        cell: (info) => renderProxyTypeBadge(info.getValue()),
+        cell: (info) => renderProxyTypeBadge(t, info.getValue()),
       }),
       col.display({
         id: "platform_account",
@@ -1031,7 +1038,7 @@ export function RequestLogsPage() {
                   </div>
                   <div>
                     <span>{t("代理类型")}</span>
-                    <p>{renderProxyTypeBadge(detailLog.proxy_type, "drawer")}</p>
+                    <p>{renderProxyTypeBadge(t, detailLog.proxy_type, "drawer")}</p>
                   </div>
                   <div>
                     <span>{t("HTTP")}</span>
