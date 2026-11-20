@@ -1,0 +1,23 @@
+# Resin v1.3.0 (upstream lineage)
+
+> Provenance: release notes of upstream `Resinat/Resin` v1.3.0, kept verbatim.
+> Both lineages spent the same version numbers on different releases, so the
+> fork's own v1.3.0 lives in [`v1.3.0.md`](v1.3.0.md) and this file preserves
+> the upstream text without attributing it to the fork release.
+
+## Changes
+
+- Added composable tag filters and lease account search.
+- Improved dashboard throughput charts and request log query performance.
+- Fixed subscription parsing for QUIC, VMess HTTP headers, and HTTPS proxy names.
+- Updated AnyTLS to v0.0.13 and improved provider compatibility.
+- Source builds now display their Git revision by default.
+- Updated Go to 1.26.10 and dependencies to fix security vulnerabilities.
+
+## Upgrade Notes
+
+> [!IMPORTANT]
+> Persisted legacy Platform regex filters are automatically migrated to composable tag-filter rules during startup. This database migration is irreversible because earlier releases cannot represent OR or exclusion rules.
+
+- Back up `<RESIN_STATE_DIR>/state.db` before upgrading.
+- To downgrade to an earlier release, stop Resin and restore the pre-upgrade backup. Do not attempt to roll back the migrated database.

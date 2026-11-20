@@ -540,7 +540,7 @@ func TestSingboxBuilder_ParseExtendedProtocols(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ob, err := b.Build(tc.raw)
 			if err != nil {
-				if tc.missingFeatureHint != "" && strings.Contains(err.Error(), tc.missingFeatureHint) {
+				if outboundFeatureUnavailable(err, tc.missingFeatureHint) {
 					t.Skipf("skipping %s: %v", tc.name, err)
 					return
 				}
@@ -621,7 +621,7 @@ func TestSingboxBuilder_ParseDomainServerProtocols(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ob, err := b.Build(tc.raw)
 			if err != nil {
-				if tc.missingFeatureHint != "" && strings.Contains(err.Error(), tc.missingFeatureHint) {
+				if outboundFeatureUnavailable(err, tc.missingFeatureHint) {
 					t.Skipf("skipping %s: %v", tc.name, err)
 					return
 				}
@@ -637,6 +637,16 @@ func TestSingboxBuilder_ParseDomainServerProtocols(t *testing.T) {
 			}
 		})
 	}
+}
+
+func outboundFeatureUnavailable(err error, featureHint string) bool {
+	if featureHint == "" {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, featureHint) ||
+		(featureHint == "WireGuard is not included in this build" &&
+			strings.Contains(message, "gVisor is not included in this build"))
 }
 
 type domainFixtureDNSRouter struct{ adapter.DNSRouter }
