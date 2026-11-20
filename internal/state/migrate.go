@@ -29,7 +29,8 @@ const (
 	stateVersionAddEndpointEnabled               = 8
 	stateVersionPlatformRegexFilterRules         = 9
 	stateVersionPlatformMaxReferenceLatency      = 10
-	stateLatestVersion                           = stateVersionPlatformMaxReferenceLatency
+	stateVersionSubscriptionChainProxy           = 11
+	stateLatestVersion                           = stateVersionSubscriptionChainProxy
 	stateLegacyBaselineVersion                   = stateVersionAddFixedAccountHeader
 
 	stateBaseSchemaMigration = stateMigrationsPath + "/000001_state_base.up.sql"
@@ -47,7 +48,7 @@ func MigrateStateDB(db *sql.DB) error {
 
 // MigrateCacheDB applies cache.db migrations.
 func MigrateCacheDB(db *sql.DB) error {
-	return migrateSQLiteDB(db, cacheMigrationsPath, migrateDefaultTable, nil)
+	return migrateSQLiteDB(db, cacheMigrationsPath, migrateDefaultTable, prepareCacheCollision)
 }
 
 const migrateDefaultTable = "schema_migrations"
@@ -94,7 +95,7 @@ func prepareLegacyStateBaseline(db *sql.DB, driver migratedb.Driver) error {
 		return err
 	}
 	if hasVersion {
-		return nil
+		return repairVersionCollision(db, 10, 11, "subscriptions", "chain_proxy", "platforms", "max_reference_latency_ms", "migrations/state/000010_platforms_add_max_reference_latency.up.sql")
 	}
 
 	hasPlatforms, err := hasTable(db, "platforms")
@@ -146,6 +147,56 @@ func prepareLegacyStateBaseline(db *sql.DB, driver migratedb.Driver) error {
 		// No baseline metadata: migrate from base schema.
 		return nil
 	}
+}
+
+// repairVersionCollision upgrades databases that used the upstream meaning of
+// a version also used by the fork. Keep schema changes and version atomic.
+func repairVersionCollision(db *sql.DB, oldVersion, newVersion int, upstreamTable, upstreamColumn, forkTable, forkColumn, forkMigration string) error {
+	var version int
+	var dirty bool
+	err := db.QueryRow("SELECT version, dirty FROM schema_migrations LIMIT 1").Scan(&version, &dirty)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if version != oldVersion || dirty {
+		return nil
+	}
+	upstream, err := hasTableColumn(db, upstreamTable, upstreamColumn)
+	if err != nil {
+		return err
+	}
+	if !upstream {
+		return nil
+	}
+	fork, err := hasTableColumn(db, forkTable, forkColumn)
+	if err != nil {
+		return err
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if !fork {
+		migration, err := migrationsFS.ReadFile(forkMigration)
+		if err != nil {
+			return err
+		}
+		if _, err = tx.Exec(string(migration)); err != nil {
+			return err
+		}
+	}
+	if _, err = tx.Exec("UPDATE schema_migrations SET version = ?", newVersion); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func prepareCacheCollision(db *sql.DB, _ migratedb.Driver) error {
+	return repairVersionCollision(db, 3, 4, "nodes_dynamic", "chain_proxy", "nodes_dynamic", "penalty_units", "migrations/cache/000003_node_penalty.up.sql")
 }
 
 func hasMigrationVersion(db *sql.DB, table string) (bool, error) {

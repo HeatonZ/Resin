@@ -178,10 +178,11 @@ URL 不允许包含查询部分与 ? 字符。
 
 | 场景 | HTTP Code | X-Resin-Error | 说明 |
 |------|-----------|---------------|------|
-| Dial 上游失败（HTTP 正向代理 CONNECT） | 502 Bad Gateway | `UPSTREAM_CONNECT_FAILED` | 通过节点拨号连接目标失败（连接被拒、网络不可达等）。同时触发 `RecordResult(false)`。 |
-| 上游连接超时 | 504 Gateway Timeout | `UPSTREAM_TIMEOUT` | 连接上游或等待上游响应超时。同时触发 `RecordResult(false)`。 |
-| 上游请求失败（HTTP 正向代理 HTTP） | 502 Bad Gateway | `UPSTREAM_REQUEST_FAILED` | 通过节点转发 HTTP 请求失败（如读写错误）。同时触发 `RecordResult(false)`。 |
-| 上游请求失败（反向代理） | 502 Bad Gateway | `UPSTREAM_REQUEST_FAILED` | 反向代理通过 `httputil.ReverseProxy` 的 `ErrorHandler` 回调捕获的上游错误。同时触发 `RecordResult(false)`。 |
+| 无健康且协议兼容的链式代理线路节点 | 503 Service Unavailable | `NO_AVAILABLE_RELAY` | 已选中落地节点，但无法为本次底层拨号选择线路。不回退直连，不增加落地失败计数。 |
+| Dial 上游失败（HTTP 正向代理 CONNECT） | 502 Bad Gateway | `UPSTREAM_CONNECT_FAILED` | 通过节点拨号连接目标失败（连接被拒、网络不可达等），提交本次出站版本的失败反馈。 |
+| 上游连接超时 | 504 Gateway Timeout | `UPSTREAM_TIMEOUT` | 连接上游或等待上游响应超时，提交本次出站版本的失败反馈。 |
+| 上游请求失败（HTTP 正向代理 HTTP） | 502 Bad Gateway | `UPSTREAM_REQUEST_FAILED` | 通过节点转发 HTTP 请求失败（如读写错误），提交本次出站版本的失败反馈。 |
+| 上游请求失败（反向代理） | 502 Bad Gateway | `UPSTREAM_REQUEST_FAILED` | 反向代理通过 `httputil.ReverseProxy` 的 `ErrorHandler` 回调捕获上游错误，提交本次出站版本的失败反馈。 |
 
 ### SOCKS5 协议返回
 
@@ -193,13 +194,14 @@ SOCKS5 正向代理只支持 SOCKS5 `CONNECT`。它使用标准 SOCKS5 / RFC1929
 | RFC1929 用户名密码认证失败 | 用户名密码子协商回复 `0x01 0x01` | `RESIN_PROXY_TOKEN` 非空时密码必须等于 `PROXY_TOKEN`。 |
 | 命令不是 `CONNECT` | SOCKS5 reply `REP=0x07` | 当前实现不支持 `BIND` / `UDP ASSOCIATE`。 |
 | 地址类型不支持 | SOCKS5 reply `REP=0x08` | 当前仅支持 IPv4 / IPv6 / 域名三类标准地址。 |
-| 路由失败、无可用节点、拨号失败、超时、向客户端写入成功回复失败 | SOCKS5 reply `REP=0x01` | 协议面统一暴露为 `GENERAL FAILURE`；更细粒度的 `resin_error` / `upstream_stage` 仅记录在请求日志中。 |
+| 路由失败、无可用节点或线路、拨号失败、超时、向客户端写入成功回复失败 | SOCKS5 reply `REP=0x01` | 协议面统一暴露为 `GENERAL FAILURE`；更细粒度的 `resin_error` / `upstream_stage` 仅记录在请求日志中。 |
 | 成功建立隧道 | SOCKS5 reply `REP=0x00` | 回复成功后进入原始双向 TCP 隧道。 |
 
 ### 隧道型正向代理特殊行为
 * HTTP 正向代理的 `CONNECT` 请求在成功建立隧道后，返回 `HTTP/1.1 200 Connection Established`。
 * SOCKS5 正向代理在成功建立隧道后，返回标准 SOCKS5 success reply（`REP=0x00`）。
 * 两种隧道在成功建立后，Resin 都不再介入更高层协议语义，连接进入双向 TCP 转发。隧道建立后的网络错误不会再生成 HTTP 响应或新的 SOCKS5 reply；连接将直接中断。
+* 若 `NO_AVAILABLE_RELAY` 延迟到隧道复制阶段才返回，同样只关闭隧道并记录该错误，不再改写已发出的成功回复，也不增加落地失败计数。
 
 ### 错误响应示例
 正向代理认证失败：
@@ -243,11 +245,12 @@ No available proxy nodes
 * 结构：`xsync.Map<NodeHash, NodeEntry>`。NodeEntry 包含了节点的详细信息。
 * 职责：维护每个节点的详细信息。作为系统状态的收敛点，保证节点管理的幂等性。
 * 节点增删接口：
-    * `AddNodeFromSub(node, subID)`: 如果节点存在，将 subID 加入引用集合；如果不存在，创建节点并将 subID 加入引用集合。新创建的节点默认进入熔断状态（`CircuitOpenSince = now`），需要后续 `RecordResult(true)`（通常由主动/被动探测触发）恢复为可路由。此操作注意给目标节点的 SubscriptionIDs 加锁。重复添加相同的 (node, subID) 对是幂等的。另外，每次调用 `AddNodeFromSub`，都要重新检查每个平台对这个节点的过滤。因为 `AddNodeFromSub` 可能引入新 Tag。
+    * `AddNodeFromSub(node, subID)`: 如果节点存在，将 subID 加入引用集合；如果不存在，创建节点并将 subID 加入引用集合。新创建的节点默认进入熔断状态（`CircuitOpenSince = now`），需要后续当前出站版本的成功反馈（通常由主动/被动探测触发）恢复为可路由。此操作注意给目标节点的 SubscriptionIDs 加锁。重复添加相同的 (node, subID) 对是幂等的。另外，每次调用 `AddNodeFromSub`，都要重新检查每个平台对这个节点的过滤。因为 `AddNodeFromSub` 可能引入新 Tag。
     * `RemoveNodeFromSub(nodeHash, subID)`: 将 subID 从引用集合移除。如果引用集合为空，则从全局池物理删除节点。此操作注意给目标节点的 SubscriptionIDs 加锁。重复删除是幂等的。调用不存在的 `nodeHash` 也不报错。另外，每次调用 `RemoveNodeFromSub`，都要重新检查每个平台对这个节点的过滤。因为 `RemoveNodeFromSub` 可能删除 Tag。
 
 * NodeEntry 结构：
-	* Outbound：atomic.Pointer[adapter.Outbound]，sing-box 的 Outbound 实例。可能为空，例如 Outbound 创建失败。空 Outbound 节点不可路由。
+	* Outbound：atomic.Pointer[adapter.Outbound]，当前模式唯一的已发布出站，包装一个 sing-box 原生实例及其不可变版本。创建失败或模式切换重建期间可能为空，不可路由。
+	* RoutingRole / RoutingVersion：从订阅归属聚合的节点角色与出站模式版本。节点创建和普通/链式模式切换时分配进程内唯一、非零的版本；线路与普通节点共享普通出站模式。
 	* --- Dynamic information ---
 	* FailureCount：连续失败的次数。
   * LatencyTable：极简内存结构，分为 **Authority 常驻区** 与 **普通站点 LRU 区**。普通站点 LRU 区大小由 `RESIN_MAX_LATENCY_TABLE_ENTRIES` 控制，使用 eTLD+1 域名作为索引，记录各站点的节点延迟。使用 TD-EWMA 维护。
@@ -270,6 +273,10 @@ No available proxy nodes
 	* MatchTagFilter(filter TagFilter, subLookup SubLookupFunc) bool：按“节点标签过滤规则”判断节点是否匹配。
 
 本项目不使用原生的 sing-box OutboundManager，而是实现上述高性能 Outbound Manager。
+
+每个节点只发布当前出站模式的一个实例。出站发布与角色切换由节点表的单节点原子更新串行化；发布须匹配节点身份、模式版本及预期出站指针，构建和关闭在原子更新之外执行。模式切换先撤销出站，再更新版本；当前版本出站就绪前节点不可路由，已有连接可能中断。管理器关闭时停止接收构建任务，等待在途任务结束后回收出站。
+
+HTTP Transport 按节点 Hash 缓存并绑定出站版本。请求所选路由、Transport 与出站实例的版本必须一致，否则返回 `NO_AVAILABLE_NODES`。不同出站模式的连接池相互隔离。
 
 #### Platform 可路由视图
 * 结构：`Custom Set：64 分片 * (RWMutex + Slice + Map)`
@@ -308,11 +315,38 @@ Resin 从订阅中获取节点配置。
 * Ephemeral：是否为临时订阅。临时订阅指的是，当节点被连续熔断超过该订阅的 EphemeralNodeEvictDelay 时间后，会从订阅中物理移除该节点（从而全局池的引用减 1）。
 * EphemeralNodeEvictDelay：临时节点驱逐延迟（每个订阅独立配置）。仅对 Ephemeral=True 的订阅生效。默认 72 小时。
 * Enabled：订阅是否启用。当订阅被禁用，会重建各 Platform 的可路由池，而不会把节点从全局池删除。
+* ChainProxy / ChainRelay：链式代理落地、线路标记，默认均为 false；同一订阅不可同时为 true，对应 API 字段 `chain_proxy`、`chain_relay`。
 * CreatedAt：订阅创建时间
 * LastChecked：订阅的最后检查时间
 * LastUpdated：订阅的最后更新时间
 * LastError：订阅的最后错误信息，主要指的是下载订阅内容的失败。节点解析失败不在此列。
 * ManagedNodes：xsync.Map<NodeHash, []string>，即订阅视图。Value 是 Tag 列表。
+
+#### 链式代理
+
+流量路径为 `Resin → 线路节点（跳板）→ 落地节点 → 目标`。订阅策略与配置标记的对应关系如下：
+
+| 策略 | chain_proxy | chain_relay |
+|------|-------------|-------------|
+| 关 | false | false |
+| 允许作为线路节点 | false | true |
+| 仅通过线路节点落地 | true | false |
+
+节点角色在全局池统一聚合：任一仍持有该节点、未淘汰的订阅设置了线路标记，就按线路处理；否则任一订阅设置落地标记，就按链式落地处理；其余为普通节点。禁用订阅仍贡献角色标记；节点进入可用候选还要求至少一个持有订阅启用。角色是订阅归属派生的运行时状态，与不可变的 RawOptions 和节点 Hash 分离；各订阅按 Hash 引用同一个节点实例。
+
+线路选择独立于业务路由和租约：先筛健康且支持实际底层 TCP/UDP 的线路，优先使用与落地出口地区相同的候选；该地区无可用候选或落地地区未知时使用全局候选。延迟评分复用线路节点自身的权威站点测量，P2C 比较 `P2CLatencyWindow` 内双方共同权威站点的平均延迟，无可比数据时按平局处理。
+
+候选按传输类型维护全局、地区快照视图，角色、健康、地区及启用状态变化时更新。出站构建时规范化转发能力；HTTP/SSH/Tor 仅 TCP，普通 SOCKS4/4a 不支持 UDP，ShadowTLS 不作为任意目标的通用线路。业务请求为 TCP 不代表底层只需 TCP，例如 Hysteria2 连接服务器需要 UDP。
+
+链式落地通过独立服务作用域中的 `detour` 拨号器访问线路。被选线路使用普通出站模式，链路固定为两跳。协议配置受 sing-box 出站能力约束，例如 WireGuard 的 GSO 与 detour 不兼容。
+
+同一落地出站的新建底层连接共享一个线路绑定，使该落地的流量保持稳定路径。绑定在首次连接时建立；绑定的节点实例被删除或替换、线路不再满足候选条件，或线路与落地任一节点熔断时，绑定失效。熔断后的恢复不会使旧绑定重新有效。地区优先和 P2C 用于建立与重选绑定，已有有效绑定不因新候选或延迟变化而轮换。
+
+落地已熔断时仍允许恢复尝试建立绑定。尝试成功则保留绑定并按健康规则恢复；尝试失败且落地仍熔断时，撤销能够确认由该尝试使用的绑定。绑定身份来自本次实际选线或连接，无法观察的旧协议会话不借用当前绑定身份。旧绑定的反馈不能直接撤销新绑定。绑定失效不额外触发探测，下一次实际建连或原定探测时才重选。
+
+绑定属于落地出站实例的运行时状态，随实例重建而重置，不持久化。重选只影响后续新建底层连接，已有连接和协议复用会话继续使用原线路。
+
+链式配置或节点归属变化时重新聚合角色。普通/链式模式切换使健康、出口 IP、延迟和错误状态失效，并触发重新探测。线路与普通角色互换时沿用同一普通出站实例。
 
 #### 订阅解析器
 订阅解析器的职责是从订阅内容中提取节点信息。实现通用解析器 `GeneralSubscriptionParser`，支持以下输入格式：
@@ -378,22 +412,37 @@ Platform 过滤时，通过 `NodeEntry.MatchTagFilter` 方法，反向查询 Ref
 ## 节点健康管理
 
 ### 健康管理接口
-全局节点池提供一组线程安全的健康管理接口，供被动反馈与主动探测调用。这些接口是系统维护节点状态的唯一入口。
+运行时被动反馈与主动探测统一调用 `ApplyFeedback(hash, version, feedback)`。反馈包含网络结果、延迟、出口和错误中的相关项；只接受与当前节点出站版本匹配的非零版本反馈。
 
-* `RecordResult(id NodeHash, success bool)`：提交节点的一次网络请求结果。
-	* `success=true`：重置连续失败计数 (`FailureCount = 0`)。若节点当前处于熔断状态，立即恢复（`清空 CircuitOpenSince`）。
-	* `success=false`：原子递增连续失败计数。若计数达到配置的阈值 (`MaxConsecutiveFailures`)，触发熔断（`CircuitOpenSince = 当前时间`）。
-* `RecordPassiveResult(platformID string, id NodeHash, success bool)`：提交来自用户代理流量的被动网络结果。若对应 Platform 开启 `passive_circuit_breaker_disabled`，则忽略失败结果，不增加连续失败计数；成功结果仍作为正向健康反馈处理。
-* `RecordLatency(id NodeHash, domain string, latency *Duration)`：提交节点对特定域名的延迟探测尝试。`latency=nil` 表示“仅记录本次探测尝试，不写延迟样本”；`latency!=nil` 时按 TD-EWMA 更新延迟统计。无论 `latency` 是否为空，都会更新 `LastLatencyProbeAttempt`，若域名属于 `LatencyAuthorities` 还会更新 `LastAuthorityLatencyProbeAttempt`。如果调用本次 `RecordLatency` 之前，节点的 `LatencyTable` 为空，需要通知各 Platform 重新过滤这个节点。
-* `UpdateNodeEgressIP(id NodeHash, ip *netip.Addr)`：记录一次出口 IP 探测尝试并可选更新出口 IP。`ip=nil` 表示“仅记录尝试”；`ip!=nil` 时更新出口 IP（若变更则触发 Platform 脏更新）。无论 `ip` 是否为空，都会更新 `LastEgressUpdateAttempt`。
+* 网络结果为成功时，重置 FailureCount 并清空 CircuitOpenSince；失败时递增计数，达到 MaxConsecutiveFailures 后熔断。被动反馈附带 PlatformID，对应平台禁用被动熔断时忽略失败计数，成功仍有效。
+* 延迟为 nil 时只记录尝试时间，非空时更新 TD-EWMA；权威域名同时更新 LastAuthorityLatencyProbeAttempt。首次得到延迟样本时通知平台重新过滤。
+* 出口探测总是更新 LastEgressUpdateAttempt；成功样本更新出口 IP、地区和 LastEgressUpdate，出口变化时通知平台重新过滤。
+
+版本检查与状态修改在节点表的单节点原子更新中完成。外部通知、视图遍历及出站生命周期操作在原子更新之外执行。
+
+#### 链式代理的健康反馈
+
+链式代理使用同一套节点健康与熔断规则，失败计数按可确认的故障范围归属：
+
+| 情况 | 失败计数 | 处理 |
+|------|----------|------|
+| 无健康兼容线路 | 不计节点失败 | 拒绝请求，不回退直连 |
+| 链式请求成功，且能确认实际线路身份 | 清空落地和实际线路的连续失败计数 | 分别校验各自的出站版本 |
+| 能确认线路服务器的 TCP 连接失败 | 仅计实际线路节点 | 达到熔断阈值后，线路失去候选资格，后续连接重选 |
+| 无法确认故障发生在哪一跳 | 计落地整条链路失败 | 能确认实际线路身份时，调度线路独立探测 |
+| 请求或探测被取消 | 不计节点失败 | 主动探测仍保留尝试时间与错误记录 |
+
+分跳归因必须有连接阶段的直接证据。DNS 错误、一般握手或会话错误本身不足以证明线路服务器的 TCP 连接失败；协议未暴露足够证据时，按归属不明处理。正常连接结束不作为故障。
+
+线路身份来自本次拨号或实际复用的连接，重选后的绑定不能代表旧连接。反馈分别校验对应节点的出站版本；无法确认线路身份时，不给线路记失败或调度线路探测。独立探测只判断线路自身健康，不用于反推原请求的故障位置。落地探测即使因线路故障失败，也应记录本次尝试。
 
 ### 熔断与恢复机制
 Resin 使用计数器熔断机制保护系统稳定性。
 * 默认状态：新节点加入系统时默认是熔断状态。包括订阅同步创建的新节点，以及启动恢复时从 `nodes_static` 注入但尚未被 `nodes_dynamic` 覆盖的节点。（节点默认不熔断其实也能工作，因为进入平台路由池的条件还有“有出口”与“有延迟”，已经有这层兜底在了。把默认状态改成熔断其实是为了逻辑上更清晰。另外，把没准备好的节点与熔断分为一类。前端进行过滤的时候，不会在健康过滤器下看到“待测”状态）
-* 熔断触发：仅由 `RecordResult(id, false)` 触发。当连续失败次数 >= 阈值时，节点进入熔断状态。熔断的节点会立即从所有 Platform 的可路由视图中移除，不再承载用户流量。
-	* 用户代理流量通过 `RecordPassiveResult(platformID, id, false)` 上报失败；当对应 Platform 开启 `passive_circuit_breaker_disabled` 时，这类失败不会触发熔断。
-	* 主动探测仍直接使用 `RecordResult(id, false)`，不受 Platform 的 `passive_circuit_breaker_disabled` 影响。
-* 熔断恢复：熔断后的节点依然保留在全局池中，接受 ProbeManager 的主动探测。一旦 `RecordResult(id, true)` 被调用（通常由主动探测触发），节点立即恢复，重新加入可路由视图。
+* 熔断触发：由 `ApplyFeedback` 接受的当前出站版本失败结果触发。当连续失败次数 >= 阈值时，节点进入熔断状态。熔断的节点会立即从所有 Platform 的可路由视图中移除，不再承载用户流量。
+	* 用户代理流量的反馈携带 PlatformID；当对应 Platform 开启 `passive_circuit_breaker_disabled` 时，这类失败不会触发熔断。
+	* 主动探测不携带 PlatformID，不受该平台配置影响。
+* 熔断恢复：熔断后的节点依然保留在全局池中，接受 ProbeManager 的主动探测。当前出站版本的成功反馈到达后，节点立即恢复，再按过滤条件加入可路由视图。
 * 熔断逻辑由全局代理池管理。禁止其他模块直接修改节点的熔断状态。
 
 ### 延迟统计 (TD-EWMA)
@@ -411,9 +460,8 @@ Resin 使用计数器熔断机制保护系统稳定性。
 * 探测时机与调度策略：每隔 13～17 秒全局扫描一次。调度依据是 `LastEgressUpdateAttempt`：对未来 15 秒内将会或者已经超过 `MaxEgressTestInterval` 的节点进行探测。另外，新的节点加入全局节点池时，需要立即进行一次出口探测。
 * 探测动作：通过节点请求 `https://cloudflare.com/cdn-cgi/trace` (GET)。
 * 结果处理：
-	* 记录本次网络请求的结果。调用 `RecordResult(id, true/false)`。
-  * 如果成功，作为副作用，会更新对 Cloudflare 的延迟统计，调用 `RecordLatency(id, "cloudflare.com", &latency)`。
-	* 无论成功或失败，都会调用 `UpdateNodeEgressIP` 记录尝试时间；成功时携带解析后的 `ip`，失败时传 `nil`。
+    * 通过 `ApplyFeedback` 一次提交本次出站版本的网络结果、出口探测尝试和错误信息；无可用线路时不提交网络失败结果。
+    * 请求成功时附带 Cloudflare 延迟，出口解析成功时附带 IP 和地区；失败仍记录出口探测尝试时间。
 
 #### 主动延迟探测
 * 目标：全局节点池所有节点。
@@ -424,14 +472,16 @@ Resin 使用计数器熔断机制保护系统稳定性。
 * 调度策略：每隔 13～17 秒全局扫描一次，对未来 15 秒内将会或者已经满足探测时机的节点进行探测。
 * 探测动作：对全局配置的延迟探测站点发起 HTTP GET 请求，优先测量 **TLS Handshake** 耗时；若未产生 TLS 握手事件（如连接复用或明文 HTTP），回退为请求级 RTT（请求发起到首字节/请求完成）。
 * 结果处理：
-    * 成功：先调用 `RecordResult(true)`；调用 `RecordLatency(..., &latency)`（`latency<=0` 时仅记录尝试，不写样本）。
-    * 失败：调用 `RecordResult(false)` 与 `RecordLatency(..., nil)`。连续失败将导致节点熔断。
+    * 成功：通过 `ApplyFeedback` 提交本次出站版本的成功结果与延迟（`latency<=0` 时仅记录尝试，不写样本）。
+    * 失败：提交本次出站版本的错误与延迟尝试；除无可用线路外，附带失败结果，连续失败将导致节点熔断。
 
 #### 主动探测的并发控制
 ProbeManager 采用 **双优先级队列 + 固定 worker 池** 的调度模型：
 * **执行**：定期扫描器只负责把待探测节点入队；固定数量 worker 异步消费并执行探测。
 * **优先级**：支持高/普通双队列。高队列非空时仍有 10% 概率抽取普通队列，避免普通任务长期饥饿。
 * **限流**：异步并发由 worker 数量决定；同步探测接口（需要立即返回结果）不走异步队列限流路径。
+
+某种底层传输的全局线路候选从空变为可用时，将等待中的链式落地加入探测队列，尽快恢复可用性。队列未接收的任务由周期扫描重试。
 
 ### 被动延迟探测
 
@@ -442,7 +492,7 @@ ProbeManager 采用 **双优先级队列 + 固定 worker 池** 的调度模型�
     * **HTTP 正向代理**：普通请求使用 `http.Client.Do`；`CONNECT` 隧道使用 `TcpDial` 与后续 tunnel copy 的结果。
     * **SOCKS5 正向代理**：使用 `TcpDial` 与后续 tunnel copy 的结果。
     * **反向代理**：`httputil.ReverseProxy` 的 `ErrorHandler` 回调。
-    * 只要网络层建立连接成功（即便 HTTP 返回 500），通常视为节点健康（`RecordResult(true)`）；仅当网络握手失败、超时或连接被重置时，视为失败（`RecordResult(false)`）。
+    * 只要网络层建立连接成功（即便 HTTP 返回 500），通常提交成功反馈；网络握手失败、超时或连接被重置时提交失败反馈。无可用线路不计入落地失败。
 * **延迟信号 (TLS Handshake)**：
     * 绝大多数业务流量为 HTTPS。Resin 的 HTTP 正向代理、SOCKS5 正向代理与反向代理均通过测量 **TLS Handshake RTT** 来评估节点延迟。
     * **隧道型正向代理（HTTP CONNECT / SOCKS5 CONNECT）**：包装目标连接，记录从写入 Client Hello (首字节) 到收到 Server Hello (由于 TCP 流式特性，通常是首个读操作) 的时间差。参考附录中的 `tlsLatencyConn` 实现。
@@ -455,11 +505,11 @@ ProbeManager 采用 **双优先级队列 + 固定 worker 池** 的调度模型�
 * **尝试时间戳更新规则**：
     * 普通站点访问：更新 `LastLatencyProbeAttempt`。
     * 权威站点访问：更新 `LastLatencyProbeAttempt` 与 `LastAuthorityLatencyProbeAttempt`。
-    * 访问失败时仍会记录尝试（`RecordLatency(..., nil)`）。
+    * 访问失败时仍会记录尝试（反馈携带 Target，Latency 为 nil）。
 * **反馈回路**：
     1. 流量经过代理。
     2. 代理捕获连接状态与握手耗时。
-    3. 异步调用 `RecordResult` 与 `RecordLatency`。
+    3. 异步调用 `ApplyFeedback`，携带路由选定的节点 Hash、出站版本及相应结果或延迟。
     4. 全局节点池更新节点的 `FailureCount`、`CircuitOpenSince` 状态及 `LatencyTable`。
 
 另外，如果节点的 Outbound 为空，跳过对其的探测，而不是记做失败。不能因为 Outbound 为空而把一个节点熔断。
@@ -596,15 +646,15 @@ Resin 项目中所有的数据库都设计为单写，不会有多进程写入�
 #### state.db
 * system_config(config_json, version, updated_at_ns)
 * platforms(id PK, name UNIQUE, sticky_ttl_ns, regex_filters_json, region_filters_json, reverse_proxy_miss_action, reverse_proxy_empty_account_behavior, reverse_proxy_fixed_account_header, allocation_policy, passive_circuit_breaker_disabled, updated_at_ns)
-* subscriptions(id PK, name, url, update_interval_ns, enabled, ephemeral, created_at_ns, updated_at_ns)
+* subscriptions(id PK, name, url, update_interval_ns, enabled, ephemeral, chain_proxy, chain_relay, created_at_ns, updated_at_ns)
 * account_header_rules(url_prefix PK, headers_json, updated_at_ns)
 
 > 订阅的 LastCheck、LastError、LastUpdate 不进行持久化。因为启动时总是会更新一次。
 
 #### cache.db
 * nodes_static(hash PK, raw_options_json, created_at_ns)
-* nodes_dynamic(hash PK, failure_count, circuit_open_since, egress_ip, egress_updated_at_ns, last_latency_probe_attempt_ns, last_authority_latency_probe_attempt_ns, last_egress_update_attempt_ns)
-* node_latency(node_hash, domain, ewma_ns, last_updated_ns, PK(node_hash,domain))。
+* nodes_dynamic(hash PK, failure_count, circuit_open_since, egress_ip, egress_updated_at_ns, last_latency_probe_attempt_ns, last_authority_latency_probe_attempt_ns, last_egress_update_attempt_ns, chain_proxy)
+* node_latency(node_hash, domain, ewma_ns, last_updated_ns, chain_proxy, PK(node_hash,domain))。
 * leases(platform_id, account, node_hash, egress_ip, expiry_ns, last_accessed_ns, PK(platform_id,account))。
 * subscription_nodes(subscription_id, node_hash, tags_json, PK(subscription_id,node_hash))
 
@@ -647,8 +697,7 @@ Resin 项目中所有的数据库都设计为单写，不会有多进程写入�
 
 3. 加载节点基础数据
     * 从 `cache.db` 加载 `nodes_static`。
-    * 节点注入全局节点池时默认标记为熔断（`CircuitOpenSince=now`）。
-    * 并行初始化：对于每个节点，进行 `json.Unmarshal` 解析 `RawOptions`，并尝试通过 `sing-box` 创建 `Outbound` 实例。
+    * 节点分配非零、进程内唯一的出站版本，默认标记为熔断（`CircuitOpenSince=now`）；出站在订阅归属与缓存状态恢复后构建。
     * 将节点注入全局节点池（此时订阅集合为空）。
 
 4. 重建订阅视图与节点持有关系
@@ -661,7 +710,8 @@ Resin 项目中所有的数据库都设计为单写，不会有多进程写入�
 
 5. 加载节点动态状态
     * 从 `cache.db` 加载 `nodes_dynamic`，更新节点的熔断状态、失败计数、出口 IP、探测尝试时间戳。若某节点缺少 `nodes_dynamic` 记录，则保留步骤 3 的默认熔断状态。
-    * 加载 `node_latency`，恢复节点的延迟统计表。
+    * 恢复缓存测量的普通/链式模式，只加载模式匹配的 node_latency；不匹配的延迟丢弃。
+    * 根据已恢复订阅归属聚合最终角色；若实际模式与缓存不同，失效旧测量。随后并行构建当前模式出站并更新线路候选视图。
 
 6. 重建 Platform 可路由视图
     * 遍历所有 Platform。
@@ -719,15 +769,17 @@ Resin 项目中所有的数据库都设计为单写，不会有多进程写入�
 * `account`：所属账号。
 * `target_host`：目标完整 Host (e.g., `www.alpha.example:443`)。
 * `target_url`：目标完整 URL (e.g., `https://www.alpha.example/search?q=hello`)。HTTP 正向代理的 `CONNECT` 与 SOCKS5 正向代理请求为空。
-* `node_hash`：出口节点的 Hash。
+* `node_hash`：出口节点的 Hash，链式代理时为落地节点。
 * `node_tag`：出口节点展示 Tag (`<Subscription>/<Tag>`)。如果有多个订阅持有节点，选所属 subscription 创建最早的那个，同 subscription 选字典序最小的。
-* `egress_ip`：实际出口 IP 地址。
+* `egress_ip`：实际出口 IP 地址，链式代理时为落地出口。
+* `chain_proxy`：本次请求选中的出站是否为链式模式，取自实际出站快照，不根据当前订阅配置推断。旧日志默认 false。
+* `relay_node_hash` / `relay_node_tag`：实际线路节点的 Hash 与名称快照；无法追踪时为空，不代表直连。
 * `duration_ns`：请求耗时。隧道型请求（HTTP `CONNECT` / SOCKS5 `CONNECT`）记录隧道保留时长。
 * `first_byte_duration_ns`：从请求开始到观测到上游首批响应字节的耗时；未观测到时为 `0`。
 * `net_ok`：网络层是否成功 (0/1)。
 * `http_method`：HTTP 方法。HTTP `CONNECT` 记录为 `CONNECT`；SOCKS5 正向代理无 HTTP 语义，记录为空字符串。
 * `http_status`：HTTP 状态码。SOCKS5 正向代理无 HTTP 语义，记录为 `0`。
-* `resin_error`：Resin 的逻辑错误码快照（如 `UPSTREAM_TIMEOUT`、`UPSTREAM_REQUEST_FAILED`）。
+* `resin_error`：Resin 的逻辑错误码快照（如 `UPSTREAM_TIMEOUT`、`UPSTREAM_REQUEST_FAILED`、`NO_AVAILABLE_RELAY`）。
 * `upstream_stage`：失败阶段（例如 `forward_roundtrip`、`connect_dial`、`connect_upstream_to_client_copy`）。
 * `upstream_err_kind`：上游错误归类（例如 `dns_error`、`timeout`、`connection_refused`）。
 * `upstream_errno`：提取到的 errno 码（例如 `ECONNREFUSED`）。
@@ -743,6 +795,8 @@ Resin 项目中所有的数据库都设计为单写，不会有多进程写入�
 * `req_body_truncated`：请求体是否被截断 (0/1)。
 * `resp_headers_truncated`：响应头是否被截断 (0/1)。
 * `resp_body_truncated`：响应体是否被截断 (0/1)。
+
+线路记录描述实际承载请求的连接。连接复用时沿用该连接建立时的线路身份；请求重试只采用本次实际使用的连接信息，无法确认时留空。协议内部为建立会话产生的连接不参与业务请求的线路记录。协议隐藏底层会话或请求在取得可观察连接前失败时，线路字段可以为空；是否为链式代理由 `chain_proxy` 单独表示。
 
 #### request_log_payloads 表
 采用双表设计，将“元数据”与“大体积载荷”分离，提高查询与存储效率。仅当 `payload_present=1` 时存在记录。存储详细的 Header/Body 二进制数据。
@@ -1386,6 +1440,8 @@ API 阻塞到重建完成为止。
   "node_count": 1200,
   "healthy_node_count": 980,
   "ephemeral": false,
+  "chain_proxy": false,
+  "chain_relay": false,
   "ephemeral_node_evict_delay": "72h",
   "enabled": true,
   "created_at": "2026-02-10T12:00:00Z",
@@ -1395,9 +1451,11 @@ API 阻塞到重建完成为止。
 }
 ```
 
-`healthy_node_count` 规则：节点 `Outbound` 非空且节点未熔断。
+`healthy_node_count` 规则：所属订阅启用，节点当前模式的出站就绪且未熔断。
+
 * `source_type=remote`：`url` 非空，`content` 为空字符串。
 * `source_type=local`：`content` 非空，`url` 为空字符串。
+* `chain_proxy`、`chain_relay`：默认 false，同一订阅不可同时为 true；WebUI 的落地、线路角色分别映射到这两个字段。
 
 #### 列出订阅
 
@@ -1419,6 +1477,8 @@ Body：
   "update_interval": "5m",
   "enabled": true,
   "ephemeral": false,
+  "chain_proxy": false,
+  "chain_relay": false,
   "ephemeral_node_evict_delay": "72h"
 }
 ```
@@ -1434,9 +1494,9 @@ Body：
 字段要求：
 
 * 必填字段：`name`，以及按 `source_type` 决定的源字段（`remote` 需要 `url`，`local` 需要 `content`）。
-* 可选字段：`source_type`、`url`、`content`、`update_interval`、`enabled`、`ephemeral`、`ephemeral_node_evict_delay`
+* 可选字段：`source_type`、`url`、`content`、`update_interval`、`enabled`、`ephemeral`、`ephemeral_node_evict_delay`、`chain_proxy`、`chain_relay`
 * 不可传字段：`id`、`node_count`、`healthy_node_count`、`created_at`、`last_checked`、`last_updated`、`last_error`
-* 默认值：`update_interval="5m"`、`enabled=true`、`ephemeral=false`、`ephemeral_node_evict_delay="72h"`
+* 默认值：`update_interval="5m"`、`enabled=true`、`ephemeral=false`、`ephemeral_node_evict_delay="72h"`、`chain_proxy=false`、`chain_relay=false`
 
 关键校验（最小集）：
 
@@ -1446,6 +1506,7 @@ Body：
 * `source_type=local`：`content` 必填且 trim 后非空；`url` 不允许传非空值。
 * `update_interval`：合法 Go duration，且 `>=30s`。
 * `ephemeral_node_evict_delay`：合法 Go duration，且 `>=0s`。
+* `chain_proxy`、`chain_relay`：布尔值，不可同时为 true。
 
 错误码映射（最小集）：
 
@@ -1473,10 +1534,12 @@ Body（partial patch 示例）：
 字段要求：
 
 * 必填字段：无
-* 可改字段：`name`、`url`、`content`、`update_interval`、`enabled`、`ephemeral`、`ephemeral_node_evict_delay`
+* 可改字段：`name`、`url`、`content`、`update_interval`、`enabled`、`ephemeral`、`ephemeral_node_evict_delay`、`chain_proxy`、`chain_relay`
 * 不可改字段：`id`、`source_type`、`node_count`、`healthy_node_count`、`created_at`、`last_checked`、`last_updated`、`last_error`
 
 关键校验：与“创建订阅”一致。
+
+互斥校验作用于 PATCH 合并后的完整订阅配置。由线路直接切换为落地时，须在同一请求中提交 `{"chain_relay": false, "chain_proxy": true}`。
 
 错误码映射（最小集）：
 
@@ -1682,6 +1745,8 @@ Query：
 * `sort_order`：`asc` 或 `desc`（可选）
 
 支持的 `sort_by`：`tag`、`created_at`、`failure_count`、`region`。其中 `tag` 表示按照节点 tag 排序。如果有多个 tag，按照所属 subscription 创建最早的那个。同 subscription 选字典序最小的。默认按 `tag` `asc` 排序。
+
+`chain_proxy` 表示节点的当前角色是否为链式落地；`relay_node_hash`、`relay_node_tag` 表示当前有效绑定的线路，未分配或绑定失效时省略。读取节点信息只观察绑定，不触发线路分配。
 
 Response：
 ```json
@@ -1939,6 +2004,9 @@ Query（建议）：
       "node_hash": "....",
       "node_tag": "sub-A/HK-01",
       "egress_ip": "1.2.3.4",
+      "chain_proxy": false,
+      "relay_node_hash": "",
+      "relay_node_tag": "",
       "duration_ms": 532,
       "first_byte_duration_ms": 120,
       "net_ok": true,
@@ -2425,6 +2493,8 @@ Resin 支持通过 API (`PATCH /system/config`) 动态调整大部分全局运�
 ## 总览
 WebUI 分为登录态与控制台态。未登录时进入登录页；登录后使用统一的控制台外壳（左侧导航 + 右侧内容区）。
 
+统一 API 请求使用当前会话令牌收到 `401` 时，清除内存与 localStorage 中的管理员令牌，由登录守卫跳转至登录页并保留当前路径为 `next`。显式传入令牌的登录校验失败仅显示错误；旧请求的 `401` 不会清除请求期间已更换的新令牌。
+
 左侧导航包含：
 * 总览看板
 * 平台管理
@@ -2473,6 +2543,8 @@ WebUI 分为登录态与控制台态。未登录时进入登录页；登录后�
 
 工具栏包含状态过滤、关键词搜索、新建、刷新。表格行支持预览节点池、编辑、手动刷新、删除。
 
+订阅支持配置链式代理角色，规则见“链式代理”章节。
+
 点击“新建”弹出订阅创建表单，包含名称、更新间隔、订阅来源（远程 URL / 本地内容）、临时订阅开关、临时节点驱逐延迟、启用开关。
 
 点击表格行会打开订阅 Drawer，内含订阅配置编辑（基础信息、错误状态）与运维操作（手动刷新、清理失效节点、删除订阅）。
@@ -2501,7 +2573,7 @@ WebUI 分为登录态与控制台态。未登录时进入登录页；登录后�
 
 筛选区分两行：时间/平台/账号/目标主机，以及代理类型/出口 IP/网络状态/HTTP 状态，并提供刷新、重置操作。
 
-下方是日志表格（时间、代理、平台账号、目标、HTTP、网络、耗时、流量、节点），使用游标分页。
+下方是日志表格（时间、代理、平台账号、目标、HTTP、网络、耗时、流量、节点），使用游标分页。节点信息区分最终出口与前置线路，无法追踪线路时明确标示。
 
 点击日志行打开详情 Drawer，包含日志摘要、诊断信息、目标与节点信息、报文内容（请求/响应 Tab）。
 
@@ -2670,7 +2742,9 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
                 if err == nil && !tlsStart.IsZero() {
                     latency := time.Since(tlsStart)
                     // 异步记录延迟（latency=nil 时仅记录尝试）
-                    go p.health.RecordLatency(result.NodeID, domain, &latency)
+                    go p.health.ApplyFeedback(result.NodeHash, result.NodeVersion, node.Feedback{
+                        Target: domain, Latency: &latency,
+                    })
                 }
             },
         }

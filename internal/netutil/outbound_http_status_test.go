@@ -48,13 +48,13 @@ func TestHTTPGetViaOutbound_AcceptStatusRejectsGatedCodes(t *testing.T) {
 				t.Fatalf("build outbound: %v", err)
 			}
 
-			body, _, err := HTTPGetViaOutbound(context.Background(), ob, srv.URL, OutboundHTTPOptions{
+			result, err := HTTPGetViaOutbound(context.Background(), ob, srv.URL, OutboundHTTPOptions{
 				AcceptStatus: accept,
 			})
 
 			if tc.wantErr {
 				if err == nil {
-					t.Fatalf("status %d: expected rejection, got nil error (body=%q)", tc.status, string(body))
+					t.Fatalf("status %d: expected rejection, got nil error (body=%q)", tc.status, string(result.Body))
 				}
 				if tc.wantInMsg != "" && !strings.Contains(err.Error(), tc.wantInMsg) {
 					t.Fatalf("status %d: expected %q in error, got: %v", tc.status, tc.wantInMsg, err)
@@ -64,8 +64,8 @@ func TestHTTPGetViaOutbound_AcceptStatusRejectsGatedCodes(t *testing.T) {
 			if err != nil {
 				t.Fatalf("status %d: expected success, got error: %v", tc.status, err)
 			}
-			if string(body) != tc.wantBody {
-				t.Fatalf("status %d: body = %q, want %q", tc.status, string(body), tc.wantBody)
+			if string(result.Body) != tc.wantBody {
+				t.Fatalf("status %d: body = %q, want %q", tc.status, string(result.Body), tc.wantBody)
 			}
 		})
 	}
@@ -85,7 +85,7 @@ func TestHTTPGetViaOutbound_AcceptStatusOverridesRequireStatusOK(t *testing.T) {
 		t.Fatalf("build outbound: %v", err)
 	}
 
-	_, _, err = HTTPGetViaOutbound(context.Background(), ob, srv.URL, OutboundHTTPOptions{
+	_, err = HTTPGetViaOutbound(context.Background(), ob, srv.URL, OutboundHTTPOptions{
 		RequireStatusOK: true,
 		AcceptStatus:    func(code int) bool { return code == http.StatusNoContent },
 	})
@@ -110,11 +110,11 @@ func TestHTTPGetViaOutbound_NilAcceptStatusKeepsLegacyBehaviour(t *testing.T) {
 		t.Fatalf("build outbound: %v", err)
 	}
 
-	body, _, err := HTTPGetViaOutbound(context.Background(), ob, srv.URL, OutboundHTTPOptions{})
+	result, err := HTTPGetViaOutbound(context.Background(), ob, srv.URL, OutboundHTTPOptions{})
 	if err != nil {
 		t.Fatalf("nil AcceptStatus should keep legacy permissive behaviour, got: %v", err)
 	}
-	if string(body) != "legacy-body" {
-		t.Fatalf("body = %q, want %q", string(body), "legacy-body")
+	if string(result.Body) != "legacy-body" {
+		t.Fatalf("body = %q, want %q", string(result.Body), "legacy-body")
 	}
 }

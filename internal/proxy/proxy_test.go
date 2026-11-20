@@ -132,7 +132,7 @@ func TestRecordPassiveResultAsync_UsesPlatformAwareRecorder(t *testing.T) {
 	recordPassiveResultAsync(rec, routing.RouteResult{
 		PlatformID: "plat-1",
 		NodeHash:   h,
-	}, false)
+	}, false, node.RelayInfo{})
 
 	select {
 	case <-rec.done:
@@ -1469,4 +1469,24 @@ func TestFullErrorTable(t *testing.T) {
 			t.Errorf("ResinError=%q, want %q", pe.ResinError, want.header)
 		}
 	}
+}
+
+func (m *mockHealthRecorder) ApplyFeedback(hash node.Hash, _ uint64, f node.Feedback) bool {
+	if f.Result != nil {
+		m.RecordResult(hash, *f.Result)
+	}
+	if f.Target != "" {
+		m.RecordLatency(hash, f.Target, f.Latency)
+	}
+	return true
+}
+
+func (m *mockPassiveHealthRecorder) ApplyFeedback(hash node.Hash, _ uint64, f node.Feedback) bool {
+	if f.Result != nil {
+		m.RecordPassiveResult(f.PlatformID, hash, *f.Result)
+	}
+	if f.Target != "" {
+		m.RecordLatency(hash, f.Target, f.Latency)
+	}
+	return true
 }

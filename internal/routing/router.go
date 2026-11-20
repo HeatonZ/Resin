@@ -65,6 +65,8 @@ type RouteResult struct {
 	EgressIP     netip.Addr
 	NodeTag      string // display tag: "<Subscription>/<Tag>" (DESIGN.md §601)
 	LeaseCreated bool
+	NodeVersion  uint64
+	ChainProxy   bool // snapshot of the actual outbound mode selected for this request
 }
 
 const livePickAttempts = 2 // first pick + one retry
@@ -133,11 +135,12 @@ func (r *Router) routeRandom(
 	state *PlatformRoutingState,
 	targetDomain string,
 ) (RouteResult, error) {
-	h, entry, err := r.selectLiveRandomRoute(plat, state.IPLoadStats, targetDomain)
+	h, entry, version, err := r.selectLiveRandomRoute(plat, state.IPLoadStats, targetDomain)
 	if err != nil {
 		return RouteResult{}, err
 	}
 	return RouteResult{
+		NodeVersion:  version,
 		NodeHash:     h,
 		EgressIP:     entry.GetEgressIP(),
 		LeaseCreated: false,
@@ -256,7 +259,11 @@ func (r *Router) tryLeaseHit(
 	nowNs int64,
 ) (Lease, RouteResult, bool) {
 	entry, ok := r.pool.GetEntry(current.NodeHash)
-	if !ok || !plat.View().Contains(current.NodeHash) || entry.GetEgressIP() != current.EgressIP {
+	if !ok {
+		return Lease{}, RouteResult{}, false
+	}
+	version := entry.RoutingVersion()
+	if !entry.IsHealthy() || !plat.View().Contains(current.NodeHash) || entry.GetEgressIP() != current.EgressIP {
 		return Lease{}, RouteResult{}, false
 	}
 
@@ -270,6 +277,7 @@ func (r *Router) tryLeaseHit(
 		EgressIP:   current.EgressIP,
 	})
 	return newLease, RouteResult{
+		NodeVersion:  version,
 		NodeHash:     current.NodeHash,
 		EgressIP:     current.EgressIP,
 		LeaseCreated: false,
@@ -297,6 +305,14 @@ func (r *Router) tryLeaseSameIPRotation(
 		return Lease{}, RouteResult{}, false
 	}
 
+	entry, ok := r.pool.GetEntry(bestHash)
+	if !ok {
+		return Lease{}, RouteResult{}, false
+	}
+	version := entry.RoutingVersion()
+	if !entry.IsHealthy() || entry.GetEgressIP() != current.EgressIP {
+		return Lease{}, RouteResult{}, false
+	}
 	newLease := current
 	newLease.NodeHash = bestHash
 	newLease.LastAccessedNs = nowNs
@@ -309,6 +325,7 @@ func (r *Router) tryLeaseSameIPRotation(
 		EgressIP:   current.EgressIP,
 	})
 	return newLease, RouteResult{
+		NodeVersion:  version,
 		NodeHash:     bestHash,
 		EgressIP:     current.EgressIP,
 		LeaseCreated: false,
@@ -322,7 +339,7 @@ func (r *Router) createLease(
 	now time.Time,
 	nowNs int64,
 ) (Lease, RouteResult, error) {
-	h, entry, err := r.selectLiveRandomRoute(plat, state.IPLoadStats, targetDomain, state.NodeAllocationHistory)
+	h, entry, version, err := r.selectLiveRandomRoute(plat, state.IPLoadStats, targetDomain, state.NodeAllocationHistory)
 	if err != nil {
 		return Lease{}, RouteResult{}, err
 	}
@@ -339,6 +356,7 @@ func (r *Router) createLease(
 		LastAccessedNs: nowNs,
 	}
 	return lease, RouteResult{
+		NodeVersion:  version,
 		NodeHash:     lease.NodeHash,
 		EgressIP:     lease.EgressIP,
 		LeaseCreated: true,
@@ -397,23 +415,27 @@ func (r *Router) selectLiveRandomRoute(
 	stats *IPLoadStats,
 	targetDomain string,
 	histories ...*NodeAllocationHistory,
-) (node.Hash, *node.NodeEntry, error) {
+) (node.Hash, *node.NodeEntry, uint64, error) {
 	var lastMissing node.Hash
 	for i := 0; i < livePickAttempts; i++ {
 		h, err := randomRoute(plat, stats, r.pool, targetDomain, r.authorities(), r.p2cWindow(), histories...)
 		if err != nil {
-			return node.Zero, nil, err
+			return node.Zero, nil, 0, err
 		}
 		entry, ok := r.pool.GetEntry(h)
 		if ok {
-			return h, entry, nil
+			version := entry.RoutingVersion()
+			if entry.IsHealthy() {
+				return h, entry, version, nil
+			}
+
 		}
 		lastMissing = h
 	}
 	if lastMissing != node.Zero {
-		return node.Zero, nil, fmt.Errorf("%w: selected node %s no longer in pool", ErrNoAvailableNodes, lastMissing.Hex())
+		return node.Zero, nil, 0, fmt.Errorf("%w: selected node %s no longer in pool", ErrNoAvailableNodes, lastMissing.Hex())
 	}
-	return node.Zero, nil, ErrNoAvailableNodes
+	return node.Zero, nil, 0, ErrNoAvailableNodes
 }
 
 func chooseSameIPRotationCandidate(

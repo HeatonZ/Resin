@@ -14,6 +14,7 @@ import { ToastContainer } from "../../components/ui/Toast";
 import { useToast } from "../../hooks/useToast";
 import { useI18n } from "../../i18n";
 import { formatApiErrorMessage } from "../../lib/error-message";
+import { readPageSize, savePageSize } from "../../lib/page-size";
 import { formatDateTime, formatRelativeTime } from "../../lib/time";
 import { listPlatforms } from "../platforms/api";
 import type { Platform } from "../platforms/types";
@@ -270,7 +271,7 @@ export function NodesPage() {
   const [sortBy, setSortBy] = useState<NodeSortBy>("tag");
   const [sortOrder, setSortOrder] = useState<SortOrder>("asc");
   const [page, setPage] = useState(0);
-  const [pageSize, setPageSize] = useState<number>(200);
+  const [pageSize, setPageSize] = useState<number>(() => readPageSize("nodes", PAGE_SIZE_OPTIONS, 200));
   const [selectedNodeHash, setSelectedNodeHash] = useState("");
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [pendingEgressHashes, setPendingEgressHashes] = useState<Set<string>>(() => new Set());
@@ -515,6 +516,7 @@ export function NodesPage() {
   };
 
   const changePageSize = (next: number) => {
+    savePageSize("nodes", next);
     setPageSize(next);
     setPage(0);
   };
@@ -530,11 +532,21 @@ export function NodesPage() {
           <span>{sortIndicator(sortBy === "tag", sortOrder)}</span>
         </button>
       ),
-      cell: (info) => (
-        <div className="nodes-tag-cell">
-          <span title={info.getValue() as string}>{info.getValue() as string}</span>
-        </div>
-      ),
+      cell: (info) => {
+        const node = info.row.original;
+        const relayName = node.relay_node_tag || node.relay_node_hash;
+        return (
+          <div className="nodes-tag-cell">
+            <span title={info.getValue() as string}>{info.getValue() as string}</span>
+            {node.chain_proxy && (
+              <small title={relayName || t("未分配")}>
+                {t("线路：")}
+                {relayName || <em>{t("未分配")}</em>}
+              </small>
+            )}
+          </div>
+        );
+      },
     }),
     col.accessor("region", {
       header: () => (

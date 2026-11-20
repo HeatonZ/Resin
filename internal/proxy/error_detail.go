@@ -122,6 +122,13 @@ func extractErrnoCode(err error) string {
 }
 
 func normalizeErrno(errno syscall.Errno) string {
+	// Windows socket errors use Winsock values rather than POSIX errno values.
+	if errno == syscall.Errno(10054) {
+		return "ECONNRESET"
+	}
+	if errno == syscall.Errno(10053) {
+		return "ECONNABORTED"
+	}
 	switch errno {
 	case syscall.ECONNREFUSED:
 		return "ECONNREFUSED"

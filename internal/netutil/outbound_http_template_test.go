@@ -37,7 +37,7 @@ func TestHTTPGetViaOutbound_ProbeTemplateReplaysBusinessRequest(t *testing.T) {
 		t.Fatalf("build outbound: %v", err)
 	}
 
-	_, _, err = HTTPGetViaOutbound(context.Background(), ob, srv.URL, OutboundHTTPOptions{
+	_, err = HTTPGetViaOutbound(context.Background(), ob, srv.URL, OutboundHTTPOptions{
 		Method: http.MethodPost,
 		Body:   []byte(`{"model":"x","messages":[]}`),
 		Header: map[string]string{
@@ -80,7 +80,7 @@ func TestHTTPGetViaOutbound_AcceptBodyRejectsGateDocument(t *testing.T) {
 	}
 
 	markers := []string{"free tier can only be used", "abusive traffic"}
-	_, _, err = HTTPGetViaOutbound(context.Background(), ob, srv.URL, OutboundHTTPOptions{
+	_, err = HTTPGetViaOutbound(context.Background(), ob, srv.URL, OutboundHTTPOptions{
 		AcceptBody: func(body []byte) bool {
 			lower := strings.ToLower(string(body))
 			for _, m := range markers {
@@ -114,7 +114,7 @@ func TestHTTPGetViaOutbound_HealthyBodyPassesMarkerCheck(t *testing.T) {
 		t.Fatalf("build outbound: %v", err)
 	}
 
-	body, _, err := HTTPGetViaOutbound(context.Background(), ob, srv.URL, OutboundHTTPOptions{
+	result, err := HTTPGetViaOutbound(context.Background(), ob, srv.URL, OutboundHTTPOptions{
 		AcceptBody: func(b []byte) bool {
 			return !strings.Contains(strings.ToLower(string(b)), "free tier can only be used")
 		},
@@ -122,7 +122,7 @@ func TestHTTPGetViaOutbound_HealthyBodyPassesMarkerCheck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("healthy body must pass, got: %v", err)
 	}
-	if len(body) == 0 {
+	if len(result.Body) == 0 {
 		t.Fatal("expected body to be returned")
 	}
 }

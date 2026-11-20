@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/Resinat/Resin/internal/netutil"
+	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/outbound"
 	"github.com/Resinat/Resin/internal/routing"
 	M "github.com/sagernet/sing/common/metadata"
@@ -25,11 +27,12 @@ type tunnelDeps struct {
 
 type preparedTunnel struct {
 	upstreamConn net.Conn
-	recordResult func(bool)
+	recordResult func(bool, error)
 }
 
 type tunnelPrepareResult struct {
 	route         routing.RouteResult
+	relay         node.RelayInfo
 	session       *preparedTunnel
 	proxyErr      *ProxyError
 	upstreamStage string
@@ -84,7 +87,7 @@ func prepareConnectTunnel(
 	domain := netutil.ExtractDomain(target)
 	nodeHashRaw := routed.Route.NodeHash
 	if deps.health != nil {
-		go deps.health.RecordLatency(nodeHashRaw, domain, nil)
+		go recordLatencyForVersion(deps.health, nodeHashRaw, routed.Route.NodeVersion, domain, nil)
 	}
 
 	rawConn, err := routed.Outbound.DialContext(ctx, "tcp", M.ParseSocksaddr(target))
@@ -97,7 +100,7 @@ func prepareConnectTunnel(
 			}
 		}
 		if deps.health != nil {
-			recordPassiveResultAsync(deps.health, routed.Route, false)
+			recordPassiveFailureAsync(deps.health, routed.Route, err, node.RelayInfo{})
 		}
 		return tunnelPrepareResult{
 			route:         routed.Route,
@@ -107,9 +110,14 @@ func prepareConnectTunnel(
 		}
 	}
 
-	recordResult := func(ok bool) {
+	relayInfo := node.RelayInfoFromConn(rawConn)
+	recordResult := func(ok bool, err error) {
 		if deps.health != nil {
-			recordPassiveResultAsync(deps.health, routed.Route, ok)
+			if ok {
+				recordPassiveResultAsync(deps.health, routed.Route, true, relayInfo)
+			} else {
+				recordPassiveFailureAsync(deps.health, routed.Route, relayInfo.WrapError(err), relayInfo)
+			}
 		}
 	}
 
@@ -121,12 +129,13 @@ func prepareConnectTunnel(
 
 	upstreamConn := newTLSLatencyConn(upstreamBase, func(latency time.Duration) {
 		if deps.health != nil {
-			deps.health.RecordLatency(nodeHashRaw, domain, &latency)
+			recordLatencyForVersion(deps.health, nodeHashRaw, routed.Route.NodeVersion, domain, &latency)
 		}
 	})
 
 	return tunnelPrepareResult{
 		route: routed.Route,
+		relay: relayInfo,
 		session: &preparedTunnel{
 			upstreamConn: upstreamConn,
 			recordResult: recordResult,
@@ -157,7 +166,7 @@ func prepareDirectConnectTunnel(ctx context.Context, deps tunnelDeps, target str
 	return tunnelPrepareResult{
 		session: &preparedTunnel{
 			upstreamConn: upstreamConn,
-			recordResult: func(bool) {},
+			recordResult: func(bool, error) {},
 		},
 	}
 }
@@ -249,12 +258,12 @@ func pumpPreparedTunnelReader(
 	switch {
 	case !ingressErrBenign:
 		result.netOK = false
-		result.proxyErr = ErrUpstreamRequestFailed
+		result.proxyErr = tunnelCopyError(ingressResult.err)
 		result.upstreamStage = "connect_upstream_to_client_copy"
 		result.upstreamErr = ingressResult.err
 	case !egressErrBenign:
 		result.netOK = false
-		result.proxyErr = ErrUpstreamRequestFailed
+		result.proxyErr = tunnelCopyError(egressResult.err)
 		result.upstreamStage = "connect_client_to_upstream_copy"
 		result.upstreamErr = egressResult.err
 	case opts.requireBidirectionalTraffic && (ingressResult.n == 0 || egressResult.n == 0):
@@ -291,4 +300,11 @@ func makeTunnelClientReader(clientConn net.Conn, buffered *bufio.Reader) (io.Rea
 		return nil, err
 	}
 	return io.MultiReader(bytes.NewReader(prefetched), clientConn), nil
+}
+
+func tunnelCopyError(err error) *ProxyError {
+	if errors.Is(err, routing.ErrNoAvailableRelay) {
+		return ErrNoAvailableRelay
+	}
+	return ErrUpstreamRequestFailed
 }

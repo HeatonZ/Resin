@@ -16,6 +16,13 @@ type countingRecorder struct {
 	calls []bool
 }
 
+func (c *countingRecorder) ApplyFeedback(hash node.Hash, version uint64, feedback node.Feedback) bool {
+	if feedback.Result != nil {
+		c.RecordResult(hash, *feedback.Result)
+	}
+	return true
+}
+
 func (c *countingRecorder) RecordResult(hash node.Hash, success bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -66,7 +73,7 @@ func TestRecordPassiveVerdictNoEvidenceRecordsNothing(t *testing.T) {
 	rec := &countingRecorder{}
 	route := routing.RouteResult{}
 
-	recordPassiveVerdictAsync(rec, route, passiveNoEvidence)
+	recordPassiveVerdictAsync(rec, route, passiveNoEvidence, node.RelayInfo{})
 
 	// Recording is async elsewhere, so give a spawned goroutine every chance
 	// to run before asserting nothing happened.
@@ -80,7 +87,7 @@ func TestRecordPassiveVerdictFailureRecordsFailure(t *testing.T) {
 	rec := &countingRecorder{}
 	route := routing.RouteResult{}
 
-	recordPassiveVerdictAsync(rec, route, passiveFailure)
+	recordPassiveVerdictAsync(rec, route, passiveFailure, node.RelayInfo{})
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {

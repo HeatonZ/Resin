@@ -47,8 +47,9 @@ type NodeEntry struct {
 	subs atomic.Pointer[[]string]
 
 	// Atomic dynamic fields for concurrent hot-path reads.
-	FailureCount     atomic.Int32
-	CircuitOpenSince atomic.Int64 // unix-nano; 0 = not open
+	FailureCount      atomic.Int32
+	CircuitOpenSince  atomic.Int64 // unix-nano; 0 = not open
+	CircuitGeneration atomic.Uint64 // advances on each circuit opening; runtime only
 	// Lease-deletion penalty. Unlike FailureCount, this is NOT cleared by probe
 	// success: it decays over time (see EffectivePenaltyNs).
 	PenaltyUnits     atomic.Int32               // accumulated penalty units; 0 = none
@@ -65,6 +66,9 @@ type NodeEntry struct {
 
 	// Outbound instance for this node.
 	Outbound atomic.Pointer[adapter.Outbound]
+
+	// Routing changes are serialized by the owning pool.
+	routingState atomic.Uint64
 }
 
 // NewNodeEntry creates a NodeEntry with the given static fields.
@@ -79,6 +83,7 @@ func NewNodeEntry(hash Hash, rawOptions json.RawMessage, createdAt time.Time, ma
 	}
 	emptySubs := []string{}
 	e.subs.Store(&emptySubs)
+	e.routingState.Store(nextRoutingVersion.Add(1) << 2)
 	if maxLatencyTableEntries > 0 {
 		e.LatencyTable = NewLatencyTable(maxLatencyTableEntries)
 	}
@@ -275,7 +280,17 @@ func (e *NodeEntry) HasLatency() bool {
 
 // HasOutbound returns true if the node has a valid outbound instance.
 func (e *NodeEntry) HasOutbound() bool {
-	return e.Outbound.Load() != nil
+	ptr := e.Outbound.Load()
+	if ptr == nil {
+		return false
+	}
+	if v, ok := (*ptr).(interface{ RoutingVersion() uint64 }); ok && v.RoutingVersion() != e.RoutingVersion() {
+		return false
+	}
+	if ready, ok := (*ptr).(interface{ Ready() bool }); ok {
+		return ready.Ready()
+	}
+	return true
 }
 
 // IsHealthy returns true when the node can be treated as healthy for
