@@ -467,16 +467,17 @@ func (p *GlobalNodePool) MakeHealthyAndEnabledEvaluator() func(entry *node.NodeE
 // drainer does not apply the same node twice. Production hot paths use
 // markNodeDirtyAsync instead; tests and control-plane operations that assert
 // view contents immediately after a mutation use this one.
+//
+// Relay membership is pool-global, not per-platform, so it is refreshed before
+// the "no platforms registered" shortcut: a pool without platforms still has
+// to drop nodes that stopped being relay candidates.
 func (p *GlobalNodePool) notifyAllPlatformsDirty(hash node.Hash) {
-	if len(p.platformSnapshot()) == 0 {
-		return
-	}
-
 	p.dirtyMu.Lock()
 	delete(p.dirtyPending, hash) // consume a queued notification: we apply it now
 	p.dirtyMu.Unlock()
 
-	p.applyPlatformDirty(hash)
+	p.refreshRelay(hash)
+	p.notifyPlatformsDirty(hash)
 }
 
 // markNodeDirtyAsync is the non-blocking variant used on hot paths (probe
@@ -657,11 +658,17 @@ func (p *GlobalNodePool) applyFilteredDirty(hash node.Hash) {
 	p.dirtyApplied.Add(1)
 }
 
-// applyPlatformDirty runs the actual per-platform re-evaluation for one node.
-// This is the body the previous implementation executed synchronously in every
-// caller; it is unchanged apart from being reached via the queue.
+// applyPlatformDirty refreshes relay membership and then runs the actual
+// per-platform re-evaluation for one node.
 func (p *GlobalNodePool) applyPlatformDirty(hash node.Hash) {
 	p.refreshRelay(hash)
+	p.notifyPlatformsDirty(hash)
+}
+
+// notifyPlatformsDirty runs the per-platform re-evaluation for one node. This
+// is the body the previous implementation executed synchronously in every
+// caller; it is unchanged apart from being reached via the queue.
+func (p *GlobalNodePool) notifyPlatformsDirty(hash node.Hash) {
 	platforms := p.platformSnapshot()
 	if len(platforms) == 0 {
 		return
